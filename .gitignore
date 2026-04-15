@@ -1,0 +1,32 @@
+# Datasets - never push these
+data/
+*.zip
+*.tar.gz
+*.tar
+
+# Model weights - too large for GitHub
+weights/
+*.pt
+*.pth
+*.onnx
+*.h5
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and outputs
+runs/
+logs/
+*.log
