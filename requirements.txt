@@ -1,0 +1,12 @@
+# Data processing
+numpy
+pandas
+
+# Machine Learning & Computer Vision
+ultralytics # Contains YOLOv8 and its dependencies
+opencv-python
+
+# Notebooks & Plotting
+jupyter
+ipykernel
+matplotlib
