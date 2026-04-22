@@ -17,5 +17,7 @@ Data files are not committed to this repo. Download manually and place in the co
   → Extract to: data/raw/pothole/chitholian/
 
 ## After downloading
-Run: python src/preprocessing/prepare_datasets.py
-This will convert annotations and split into train/val/test automatically.
+Run the pothole dataset preprocessing script:
+`python src/preprocessing/prepare_pothole_dataset.py`
+
+This will merge the pothole datasets, convert annotations to YOLO format, and split into train/val/test automatically. *(Traffic light data preprocessing script to be added).*
