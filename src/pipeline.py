@@ -1,14 +1,20 @@
+# ═══════════════════════════════════════════════════════
+# src/pipeline.py
+# ═══════════════════════════════════════════════════════
 """
-pipeline.py
-Main inference pipeline.
+Main inference pipeline for Smart Road Assistant.
 
-PHASE 1: Only pothole_model.pt exists → detects potholes only.
-PHASE 2: All 3 models exist          → detects traffic lights + potholes.
+Phase 1: pothole_model.pt only  → pothole detection
+Phase 2: + traffic_model.pt     → traffic light + pothole detection
 
-No code changes needed between phases.
-Pipeline auto-detects which models are available in models/ folder.
+Auto-detects available models. No code changes needed between phases.
 
-Place this file at: src/pipeline.py
+Usage:
+  from src.pipeline import Pipeline
+  pipe   = Pipeline()
+  result = pipe.run(frame)          # BGR numpy array
+  result = pipe.run_image("img.jpg")
+  result = pipe.run_video("in.mp4", "out.mp4")
 """
 
 import cv2
@@ -16,40 +22,35 @@ import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
 
-# ── Model paths ────────────────────────────────────────────────────────────────
+# ── Paths ──────────────────────────────────────────────
 BASE_DIR           = Path(__file__).resolve().parent.parent
 MODELS_DIR         = BASE_DIR / "models"
-
 POTHOLE_MODEL_PATH = MODELS_DIR / "pothole_model.pt"
 TRAFFIC_MODEL_PATH = MODELS_DIR / "traffic_model.pt"
-GATE_MODEL_PATH    = MODELS_DIR / "gate_model.pt"
 
-# ── Detection thresholds ───────────────────────────────────────────────────────
-GATE_CONF = 0.35
-TASK_CONF = 0.40
+# ── Thresholds ─────────────────────────────────────────
+TASK_CONF     = 0.40
+NMS_THRESHOLD = 0.45
 
-# ── Class maps ─────────────────────────────────────────────────────────────────
-GATE_TL      = 0       # gate model: traffic_light class
-GATE_POTHOLE = 1       # gate model: pothole class
-
+# ── Class maps ─────────────────────────────────────────
 TL_COLORS = {0: "Green", 1: "Red", 2: "Yellow"}
 TL_DRAW   = {
     "Green" : (0, 200, 0),
     "Red"   : (0, 0, 220),
     "Yellow": (0, 200, 220),
 }
-POTHOLE_DRAW = (0, 140, 255)   # orange
+POTHOLE_DRAW = (0, 140, 255)  # orange
 
-# ── Pothole severity thresholds (pixel area at 640×640) ───────────────────────
+# ── Severity thresholds (pixel area at 640×640) ────────
 SEV_SMALL  = 1500
 SEV_MEDIUM = 5000
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════
 # PREPROCESSING
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 
 def detect_weather(frame):
-    """Rule-based weather detection from image statistics."""
     gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     mean_val = np.mean(gray)
     std_val  = np.std(gray)
@@ -63,70 +64,54 @@ def detect_weather(frame):
 
 
 def preprocess_common(frame):
-    """
-    Common preprocessing applied to every frame before detection.
-    Steps: resize → CLAHE → Gaussian blur → weather correction
-    """
-    # 1. Resize to YOLO input size
+    """Resize → CLAHE → blur → weather correction."""
     frame = cv2.resize(frame, (640, 640))
 
-    # 2. CLAHE contrast enhancement on L channel
+    # CLAHE on L channel
     lab     = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l       = clahe.apply(l)
     frame   = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-    # 3. Gaussian blur for noise reduction
-    frame = cv2.GaussianBlur(frame, (3, 3), 0)
+    # Noise reduction
+    frame   = cv2.GaussianBlur(frame, (3, 3), 0)
 
-    # 4. Weather-specific correction
+    # Weather correction
     weather = detect_weather(frame)
     if weather == "fog":
-        # Increase contrast to cut through haze
         frame = cv2.convertScaleAbs(frame, alpha=1.4, beta=-30)
     elif weather == "night":
-        # Boost brightness
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
         hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 2.0, 0, 255)
         frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     elif weather == "rain":
-        # Median filter to reduce rain streaks
         frame = cv2.medianBlur(frame, 3)
 
     return frame, weather
 
 
 def preprocess_traffic(frame):
-    """
-    Traffic light specific preprocessing.
-    Converts to HSV and boosts saturation to make colors more distinct.
-    """
+    """Boost saturation to make traffic light colors more vivid."""
     hsv     = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
     s = np.clip(s.astype(int) + 30, 0, 255).astype(np.uint8)
-    return cv2.merge([h, s, v])
+    return cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2BGR)
 
 
 def preprocess_pothole(frame):
-    """
-    Pothole specific preprocessing.
-    Converts to grayscale and sharpens edges for better boundary detection.
-    """
+    """Sharpen edges to improve pothole boundary detection."""
     gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    # Unsharp masking to enhance edges
     sharp   = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
-    # Convert back to BGR so YOLO can process it
     return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 # POST PROCESSING
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 
 def get_severity(box):
-    """Calculate pothole severity from bounding box pixel area."""
     x1, y1, x2, y2 = box
     area = (x2 - x1) * (y2 - y1)
     if area < SEV_SMALL:
@@ -137,10 +122,6 @@ def get_severity(box):
 
 
 def get_distance(box, frame_h=640):
-    """
-    Estimate relative distance using vertical position.
-    Lower in frame = closer to vehicle.
-    """
     _, _, _, y2 = box
     ratio = y2 / frame_h
     if ratio > 0.80:
@@ -152,8 +133,7 @@ def get_distance(box, frame_h=640):
     return "Far"
 
 
-def apply_nms(detections, iou_threshold=0.45):
-    """Remove overlapping duplicate detections."""
+def apply_nms(detections, iou_threshold=NMS_THRESHOLD):
     if not detections:
         return []
     boxes   = np.array([d["box"] for d in detections], dtype=np.float32)
@@ -166,124 +146,121 @@ def apply_nms(detections, iou_threshold=0.45):
     return [detections[i] for i in indices.flatten()]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 # OUTPUT
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 
-def draw_detections(frame, tl_dets, ph_dets):
-    """Draw bounding boxes and labels on the original frame."""
+def draw_detections(frame, tl_dets, ph_dets, weather):
     out = frame.copy()
 
+    # Weather overlay (top-left)
+    weather_color = {
+        "clear": (0, 200, 0),
+        "rain" : (200, 200, 0),
+        "fog"  : (180, 180, 180),
+        "night": (100, 100, 255),
+    }
+    cv2.putText(out, f"Weather: {weather}",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                weather_color.get(weather, (255, 255, 255)), 2)
+
+    # Traffic light boxes
     for d in tl_dets:
         x1, y1, x2, y2 = [int(v) for v in d["box"]]
         color = TL_DRAW.get(d["color"], (255, 255, 255))
         label = f"TL:{d['color']} {d['conf']:.0%}"
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.rectangle(out, (x1, y1 - 22), (x1 + len(label) * 9, y1), color, -1)
-        cv2.putText(out, label, (x1 + 2, y1 - 5),
+        cv2.rectangle(out, (x1, y1 - 24), (x1 + len(label) * 9, y1), color, -1)
+        cv2.putText(out, label, (x1 + 2, y1 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
+    # Pothole boxes
     for d in ph_dets:
         x1, y1, x2, y2 = [int(v) for v in d["box"]]
-        label = f"Pothole {d['severity']} {d['distance']} {d['conf']:.0%}"
+        label = f"Pothole|{d['severity']}|{d['distance']} {d['conf']:.0%}"
         cv2.rectangle(out, (x1, y1), (x2, y2), POTHOLE_DRAW, 2)
-        cv2.rectangle(out, (x1, y1 - 22), (x1 + len(label) * 9, y1), POTHOLE_DRAW, -1)
-        cv2.putText(out, label, (x1 + 2, y1 - 5),
+        cv2.rectangle(out, (x1, y1 - 24), (x1 + len(label) * 9, y1), POTHOLE_DRAW, -1)
+        cv2.putText(out, label, (x1 + 2, y1 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+    # Detection count (top-right)
+    count_text = f"TL:{len(tl_dets)}  PH:{len(ph_dets)}"
+    cv2.putText(out, count_text,
+                (out.shape[1] - 160, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
 
     return out
 
 
 def generate_warnings(tl_dets, ph_dets):
-    """Generate text warning messages from detections."""
     warnings = []
     for d in tl_dets:
         if d["color"] == "Red":
-            warnings.append("STOP — Red traffic light detected!")
+            warnings.append("🔴 STOP — Red traffic light detected!")
         elif d["color"] == "Yellow":
-            warnings.append("SLOW DOWN — Yellow traffic light ahead.")
+            warnings.append("🟡 SLOW DOWN — Yellow light ahead.")
         elif d["color"] == "Green":
-            warnings.append("Green light — Safe to go.")
+            warnings.append("🟢 Green light — Safe to proceed.")
     for d in ph_dets:
         warnings.append(
-            f"POTHOLE AHEAD — {d['severity']} severity, {d['distance']}!"
+            f"🟠 POTHOLE AHEAD — {d['severity']} severity, {d['distance']}!"
         )
     return warnings
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 # PIPELINE CLASS
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 
 class Pipeline:
     """
-    Main inference pipeline.
-    Automatically uses whatever models are available in models/ folder.
+    Smart Road Assistant inference pipeline.
+    Auto-detects available models.
+
+    Phase 1 (pothole_model.pt only): pothole detection
+    Phase 2 (+ traffic_model.pt)   : full detection
     """
 
     def __init__(self):
-        print("Loading available models...")
+        print("\nLoading Smart Road Assistant pipeline...")
+        print("-" * 45)
 
-        # Gate model (needed only when both other models exist)
-        self.gate_model = None
-        if GATE_MODEL_PATH.exists():
-            self.gate_model = YOLO(str(GATE_MODEL_PATH))
-            print(f"  ✅ Gate model     → {GATE_MODEL_PATH.name}")
-        else:
-            print(f"  ⬜ Gate model     → not found (will activate all available pipelines)")
-
-        # Traffic light model
         self.traffic_model = None
+        self.pothole_model = None
+
         if TRAFFIC_MODEL_PATH.exists():
             self.traffic_model = YOLO(str(TRAFFIC_MODEL_PATH))
             print(f"  ✅ Traffic model  → {TRAFFIC_MODEL_PATH.name}")
         else:
             print(f"  ⬜ Traffic model  → not found (Phase 2)")
 
-        # Pothole model
-        self.pothole_model = None
         if POTHOLE_MODEL_PATH.exists():
             self.pothole_model = YOLO(str(POTHOLE_MODEL_PATH))
             print(f"  ✅ Pothole model  → {POTHOLE_MODEL_PATH.name}")
         else:
-            print(f"  ❌ Pothole model  → not found. Run: python src/train.py --model pothole")
+            print(f"  ❌ Pothole model  → not found")
+            print(f"     Run: python src/train.py --model pothole")
 
-        print()
+        phase = 2 if (self.traffic_model and self.pothole_model) else 1
+        print(f"\n  Running in Phase {phase} mode")
+        print("-" * 45 + "\n")
 
+    # ── Core inference ──────────────────────────────────
     def run(self, frame):
         """
-        Process one BGR frame through the full pipeline.
-        Returns dict with annotated frame, warnings, and detection details.
+        Process one BGR frame.
+        Returns dict: annotated_frame, warnings, traffic_lights,
+                      potholes, weather
         """
-        original = frame.copy()
-        h, w     = original.shape[:2]
-
-        # ── Stage 2: Common preprocessing ──────────────────────────────────
+        original     = frame.copy()
+        h, w         = original.shape[:2]
         processed, weather = preprocess_common(frame)
-
-        # ── Stage 3: Gate model or default activation ───────────────────────
-        if self.gate_model is not None:
-            gate_res   = self.gate_model(processed, conf=GATE_CONF, verbose=False)
-            gate_boxes = gate_res[0].boxes
-            activate_tl = False
-            activate_ph = False
-            if gate_boxes is not None and len(gate_boxes):
-                for box in gate_boxes:
-                    cls = int(box.cls[0])
-                    if cls == GATE_TL:
-                        activate_tl = True
-                    elif cls == GATE_POTHOLE:
-                        activate_ph = True
-        else:
-            # No gate model — activate whichever pipeline has a trained model
-            activate_tl = self.traffic_model is not None
-            activate_ph = self.pothole_model is not None
 
         tl_dets = []
         ph_dets = []
 
-        # ── Stage 4A: Traffic light pipeline ────────────────────────────────
-        if activate_tl and self.traffic_model is not None:
+        # ── Traffic light detection ─────────────────────
+        if self.traffic_model is not None:
             tl_input = preprocess_traffic(processed)
             tl_preds = self.traffic_model(tl_input, conf=TASK_CONF, verbose=False)
             tl_boxes = tl_preds[0].boxes
@@ -295,7 +272,10 @@ class Pipeline:
                     cls    = int(box.cls[0])
                     conf   = float(box.conf[0])
                     color  = TL_COLORS.get(cls, "Unknown")
-                    scaled = [coords[0]*sx, coords[1]*sy, coords[2]*sx, coords[3]*sy]
+                    scaled = [
+                        coords[0]*sx, coords[1]*sy,
+                        coords[2]*sx, coords[3]*sy
+                    ]
                     tl_dets.append({
                         "box"  : scaled,
                         "cls"  : cls,
@@ -303,8 +283,8 @@ class Pipeline:
                         "conf" : conf,
                     })
 
-        # ── Stage 4B: Pothole pipeline ───────────────────────────────────────
-        if activate_ph and self.pothole_model is not None:
+        # ── Pothole detection ───────────────────────────
+        if self.pothole_model is not None:
             ph_input = preprocess_pothole(processed)
             ph_preds = self.pothole_model(ph_input, conf=TASK_CONF, verbose=False)
             ph_boxes = ph_preds[0].boxes
@@ -314,7 +294,10 @@ class Pipeline:
                 for box in ph_boxes:
                     coords   = box.xyxy[0].tolist()
                     conf     = float(box.conf[0])
-                    scaled   = [coords[0]*sx, coords[1]*sy, coords[2]*sx, coords[3]*sy]
+                    scaled   = [
+                        coords[0]*sx, coords[1]*sy,
+                        coords[2]*sx, coords[3]*sy
+                    ]
                     severity = get_severity(coords)
                     distance = get_distance(coords)
                     ph_dets.append({
@@ -324,12 +307,10 @@ class Pipeline:
                         "distance": distance,
                     })
 
-        # ── Stage 5: Post processing ─────────────────────────────────────────
-        tl_dets = apply_nms(tl_dets)
-        ph_dets = apply_nms(ph_dets)
-
-        # ── Stage 6 & 7: Warnings and annotation ────────────────────────────
-        annotated = draw_detections(original, tl_dets, ph_dets)
+        # ── NMS + output ────────────────────────────────
+        tl_dets   = apply_nms(tl_dets)
+        ph_dets   = apply_nms(ph_dets)
+        annotated = draw_detections(original, tl_dets, ph_dets, weather)
         warnings  = generate_warnings(tl_dets, ph_dets)
 
         return {
@@ -341,11 +322,19 @@ class Pipeline:
         }
 
     def run_image(self, image_path: str):
-        """Load image from path and run pipeline."""
+        """Run pipeline on a single image file."""
         frame = cv2.imread(image_path)
         if frame is None:
             raise ValueError(f"Cannot read image: {image_path}")
-        return self.run(frame)
+        result = self.run(frame)
+
+        # Save annotated image next to input
+        out_path = Path(image_path).stem + "_detected.jpg"
+        cv2.imwrite(out_path, result["annotated_frame"])
+        print(f"  Saved → {out_path}")
+        for w in result["warnings"]:
+            print(f"  {w}")
+        return result
 
     def run_video(self, video_path: str, output_path: str = None):
         """Process a video file frame by frame."""
@@ -353,9 +342,10 @@ class Pipeline:
         if not cap.isOpened():
             raise ValueError(f"Cannot open video: {video_path}")
 
-        fps    = int(cap.get(cv2.CAP_PROP_FPS))
+        fps    = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         writer = None
         if output_path:
@@ -372,9 +362,29 @@ class Pipeline:
                 writer.write(result["annotated_frame"])
             frame_count += 1
             if frame_count % 30 == 0:
-                print(f"  Processed {frame_count} frames...")
+                pct = (frame_count / total * 100) if total else 0
+                print(f"  Processed {frame_count}/{total} frames ({pct:.0f}%)...")
 
         cap.release()
         if writer:
             writer.release()
-        print(f"  ✅ Video saved → {output_path} ({frame_count} frames)")
+        print(f"  ✅ Done → {output_path}  ({frame_count} frames)")
+
+    def run_webcam(self, cam_index: int = 0):
+        """Live webcam inference. Press Q to quit."""
+        cap = cv2.VideoCapture(cam_index)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open webcam index {cam_index}")
+
+        print("  Webcam running — press Q to quit")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            result = self.run(frame)
+            cv2.imshow("Smart Road Assistant", result["annotated_frame"])
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
