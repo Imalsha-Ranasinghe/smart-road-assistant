@@ -1,0 +1,8 @@
+# Traffic dataset config
+train: data/processed/traffic/train
+val: data/processed/traffic/val
+test: data/processed/traffic/test
+classes:
+  - traffic_sign
+  - traffic_signal
+  - vehicle

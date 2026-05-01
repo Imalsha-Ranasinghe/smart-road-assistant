@@ -1,0 +1,6 @@
+# Pothole dataset config
+train: data/processed/pothole/train
+val: data/processed/pothole/val
+test: data/processed/pothole/test
+classes:
+  - pothole
