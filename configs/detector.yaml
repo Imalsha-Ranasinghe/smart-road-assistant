@@ -1,0 +1,13 @@
+# detector.yaml — Stage 1 detector reference config
+# NOTE: prepare_data.py generates the authoritative dataset.yaml inside
+#       data/processed/detector_yolo/. This file is for reference only.
+
+path: data/processed/detector_yolo
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: 2
+names:
+  - pothole
+  - traffic_light

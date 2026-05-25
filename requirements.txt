@@ -1,10 +1,13 @@
 # Data processing
 numpy
 pandas
+pyyaml
 
 # Machine Learning & Computer Vision
-ultralytics # Contains YOLOv8 and its dependencies
+ultralytics       # YOLOv8 — includes torch, torchvision, opencv-python
 opencv-python
+flask
+flask-cors
 
 # Notebooks & Plotting
 jupyter

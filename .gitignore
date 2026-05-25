@@ -1,32 +1,73 @@
-# Datasets - never push these
+# ─── Raw & processed data (too large for git) ───────────────────────────────
 data/
 *.zip
 *.tar.gz
 *.tar
+*.7z
 
-# Model weights - too large for GitHub
-weights/
+# ─── Trained model weights ───────────────────────────────────────────────────
+models/
 *.pt
 *.pth
 *.onnx
 *.h5
+*.tflite
 
-# Python
+# ─── YOLO training runs ──────────────────────────────────────────────────────
+runs/
+
+# ─── Generated output files ──────────────────────────────────────────────────
+benchmark_results.json
+output_annotated.mp4
+*_detected.jpg
+backend/uploads/
+
+# ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
-.env
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+site-packages/
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+.venv/
 venv/
 env/
+ENV/
 
-# Jupyter checkpoints
+# ─── Jupyter ─────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logs and outputs
-runs/
+# ─── Logs ────────────────────────────────────────────────────────────────────
 logs/
 *.log
+*.out
+
+# ─── Frontend build ──────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+
+# ─── IDE / OS ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Environment variables (never commit secrets) ────────────────────────────
+.env
+.env.local
+*.env
+
+# ─── Pytest ──────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/

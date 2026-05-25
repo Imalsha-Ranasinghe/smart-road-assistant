@@ -1,23 +1,26 @@
 """
-app.py — Flask backend
-Receives image/video from frontend, runs pipeline, returns results.
+app.py — Flask backend for Smart Road Assistant
 
-Place this file at: backend/app.py
-Run: python backend/app.py
+Endpoints:
+    GET  /health          — model status
+    POST /detect/image    — single image detection (multipart, field: image)
+    POST /detect/video    — video detection       (multipart, field: video)
+    GET  /video/output/<job_id>  — retrieve processed video
 """
 
 import sys
+import uuid
 import base64
+import threading
 import cv2
 import numpy as np
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
-# Add project root to path so we can import src/pipeline
 BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.append(str(BASE_DIR))
-from src.pipeline import Pipeline
+sys.path.append(str(BASE_DIR / "src"))
+from pipeline import Pipeline
 
 app = Flask(__name__)
 CORS(app)
@@ -25,12 +28,17 @@ CORS(app)
 UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Load pipeline once at startup (loads all available models)
+# Load pipeline once at startup
 pipeline = Pipeline()
 
+# In-memory job tracker for async video processing
+_video_jobs: dict = {}   # job_id → {"status": "processing"|"done"|"error", "path": Path}
+_jobs_lock = threading.Lock()
 
-def encode_image(frame):
-    """Convert OpenCV BGR frame to base64 JPEG string."""
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def encode_image(frame) -> str:
     _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return base64.b64encode(buffer).decode("utf-8")
 
@@ -39,22 +47,17 @@ def encode_image(frame):
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Check which models are loaded."""
-    from src.pipeline import POTHOLE_MODEL_PATH, TRAFFIC_MODEL_PATH, GATE_MODEL_PATH
+    from pipeline import DETECTOR_MODEL_PATH
+    from analyzers.pothole_analyzer import SEVERITY_MODEL_PATH
     return jsonify({
-        "status"        : "ok",
-        "pothole_model" : POTHOLE_MODEL_PATH.exists(),
-        "traffic_model" : TRAFFIC_MODEL_PATH.exists(),
-        "gate_model"    : GATE_MODEL_PATH.exists(),
+        "status":          "ok",
+        "detector_model":  DETECTOR_MODEL_PATH.exists(),
+        "severity_model":  SEVERITY_MODEL_PATH.exists(),
     })
 
 
 @app.route("/detect/image", methods=["POST"])
 def detect_image():
-    """
-    Accepts: multipart form with field 'image' (image file)
-    Returns: JSON with annotated image (base64), warnings, detections
-    """
     if "image" not in request.files:
         return jsonify({"error": "No image provided"}), 400
 
@@ -62,7 +65,6 @@ def detect_image():
     if not file.filename:
         return jsonify({"error": "Empty filename"}), 400
 
-    # Decode image from bytes
     file_bytes = np.frombuffer(file.read(), np.uint8)
     frame      = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if frame is None:
@@ -72,24 +74,27 @@ def detect_image():
 
     return jsonify({
         "annotated_image": encode_image(result["annotated_frame"]),
-        "warnings"       : result["warnings"],
-        "weather"        : result["weather"],
-        "traffic_lights" : [
-            {
-                "color"     : d["color"],
-                "confidence": round(d["conf"], 3),
-                "box"       : [round(v, 1) for v in d["box"]],
-            }
-            for d in result["traffic_lights"]
-        ],
+        "warnings":        result["warnings"],
         "potholes": [
             {
-                "severity"  : d["severity"],
-                "distance"  : d["distance"],
-                "confidence": round(d["conf"], 3),
-                "box"       : [round(v, 1) for v in d["box"]],
+                "severity":    d["severity"],
+                "distance":    d["distance"],
+                "confidence":  round(d["conf"], 3),
+                "instructions": d["instructions"],
+                "box":         [round(v, 1) for v in d["box"]],
+                "cv_scores":   d.get("cv_scores", {}),
             }
             for d in result["potholes"]
+        ],
+        "traffic_lights": [
+            {
+                "color":        d["color"],
+                "lane_relevant": d["lane_relevant"],
+                "confidence":   round(d["conf"], 3),
+                "instructions": d["instructions"],
+                "box":          [round(v, 1) for v in d["box"]],
+            }
+            for d in result["traffic_lights"]
         ],
     })
 
@@ -97,27 +102,59 @@ def detect_image():
 @app.route("/detect/video", methods=["POST"])
 def detect_video():
     """
-    Accepts: multipart form with field 'video' (video file)
-    Returns: JSON with path to processed video
+    Accepts a video file, starts processing in background.
+    Returns a job_id immediately; poll /video/status/<job_id>.
     """
     if "video" not in request.files:
         return jsonify({"error": "No video provided"}), 400
 
-    file     = request.files["video"]
-    in_path  = str(UPLOAD_DIR / "input.mp4")
-    out_path = str(UPLOAD_DIR / "output.mp4")
+    file   = request.files["video"]
+    job_id = str(uuid.uuid4())
 
-    file.save(in_path)
-    pipeline.run_video(in_path, output_path=out_path)
+    job_dir  = UPLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    in_path  = job_dir / "input.mp4"
+    out_path = job_dir / "output.mp4"
 
-    return jsonify({"message": "Video processed", "output": "/video/output"})
+    file.save(str(in_path))
+
+    with _jobs_lock:
+        _video_jobs[job_id] = {"status": "processing", "path": out_path}
+
+    def _process():
+        try:
+            pipeline.run_video(str(in_path), str(out_path))
+            with _jobs_lock:
+                _video_jobs[job_id]["status"] = "done"
+        except Exception as exc:
+            with _jobs_lock:
+                _video_jobs[job_id]["status"] = "error"
+                _video_jobs[job_id]["error"]  = str(exc)
+
+    threading.Thread(target=_process, daemon=True).start()
+    return jsonify({"job_id": job_id, "status": "processing"})
 
 
-@app.route("/video/output", methods=["GET"])
-def serve_video():
-    out_path = UPLOAD_DIR / "output.mp4"
+@app.route("/video/status/<job_id>", methods=["GET"])
+def video_status(job_id: str):
+    with _jobs_lock:
+        job = _video_jobs.get(job_id)
+    if job is None:
+        return jsonify({"error": "Unknown job_id"}), 404
+    return jsonify({"job_id": job_id, "status": job["status"]})
+
+
+@app.route("/video/output/<job_id>", methods=["GET"])
+def serve_video(job_id: str):
+    with _jobs_lock:
+        job = _video_jobs.get(job_id)
+    if job is None:
+        return jsonify({"error": "Unknown job_id"}), 404
+    if job["status"] != "done":
+        return jsonify({"error": f"Video not ready — status: {job['status']}"}), 202
+    out_path = job["path"]
     if not out_path.exists():
-        return jsonify({"error": "No video available"}), 404
+        return jsonify({"error": "Output file missing"}), 500
     return send_file(str(out_path), mimetype="video/mp4")
 
 
@@ -125,7 +162,7 @@ def serve_video():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print(" Smart Road Assistant — Backend")
-    print(f" Running at: http://localhost:5000")
+    print("  Smart Road Assistant — Backend")
+    print("  http://localhost:5000")
     print("=" * 50)
     app.run(host="0.0.0.0", port=5000, debug=False)

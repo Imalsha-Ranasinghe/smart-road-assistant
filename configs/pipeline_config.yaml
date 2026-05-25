@@ -1,0 +1,14 @@
+# pipeline_config.yaml
+# The severity_method line is overwritten by benchmark_severity.py after training.
+# Edit other values to tune runtime behaviour.
+
+severity_method: auto      # "cv" | "cnn" | "auto"  (auto = cnn if model exists)
+
+detector_conf:       0.40  # Stage 1 confidence threshold
+nms_iou:             0.45  # NMS IoU threshold (used by YOLO internally)
+
+# Traffic light lane-relevance thresholds
+lane_x_min:          0.20  # x_center must be > 20% of frame width
+lane_x_max:          0.80  # x_center must be < 80% of frame width
+lane_min_size_ratio: 0.001 # box_area / frame_area must exceed this
+tl_min_aspect_ratio: 1.2   # height/width of box must exceed this

@@ -1,5 +1,0 @@
-# Gate dataset config
-train: data/processed/gate/train
-val: data/processed/gate/val
-classes:
-  - gate
