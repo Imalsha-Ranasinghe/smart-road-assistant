@@ -428,6 +428,7 @@ def generate_traffic_yaml():
 # MAIN
 # ═════════════════════════════════════════════
 
+
 def prepare_pothole():
     print("\n" + "="*50)
     print("  POTHOLE DATASET")
@@ -489,5 +490,90 @@ def main():
     print("\nCheck 'previews/' folders to verify bounding boxes look correct!")
 
 
+def build_gate_dataset():
+    """
+    Combines already-processed pothole and traffic images
+    into a gate dataset with 2 classes only.
+    traffic_light = 0
+    pothole       = 1
+    """
+    import random
+    import shutil
+    from pathlib import Path
+
+    BASE_DIR  = Path(__file__).resolve().parent.parent
+    GATE_DIR  = BASE_DIR / "data" / "processed" / "gate_yolo"
+
+    # Source folders (already processed)
+    TRAFFIC_TRAIN_IMG = BASE_DIR / "data" / "processed" / "traffic_yolo" / "images" / "train"
+    TRAFFIC_TRAIN_LBL = BASE_DIR / "data" / "processed" / "traffic_yolo" / "labels" / "train"
+    POTHOLE_TRAIN_IMG = BASE_DIR / "data" / "processed" / "pothole_yolo" / "images" / "train"
+    POTHOLE_TRAIN_LBL = BASE_DIR / "data" / "processed" / "pothole_yolo" / "labels" / "train"
+
+    # Create gate directories
+    for split in ["train", "val"]:
+        (GATE_DIR / "images" / split).mkdir(parents=True, exist_ok=True)
+        (GATE_DIR / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    def collect_pairs(img_dir, lbl_dir, gate_class):
+        pairs = []
+        for img_path in img_dir.iterdir():
+            if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                continue
+            lbl_path = lbl_dir / f"{img_path.stem}.txt"
+            if lbl_path.exists():
+                pairs.append((img_path, lbl_path, gate_class))
+        return pairs
+
+    # Collect all pairs
+    traffic_pairs = collect_pairs(TRAFFIC_TRAIN_IMG, TRAFFIC_TRAIN_LBL, gate_class=0)
+    pothole_pairs = collect_pairs(POTHOLE_TRAIN_IMG, POTHOLE_TRAIN_LBL, gate_class=1)
+
+    all_pairs = traffic_pairs + pothole_pairs
+    random.seed(42)
+    random.shuffle(all_pairs)
+
+    # Split 85% train / 15% val
+    n_val   = int(len(all_pairs) * 0.15)
+    val_set = all_pairs[:n_val]
+    trn_set = all_pairs[n_val:]
+
+    print(f"  Gate dataset → Train: {len(trn_set)}  Val: {len(val_set)}")
+
+    def write_pairs(pairs, split):
+        for img_path, lbl_path, gate_cls in pairs:
+            # Copy image
+            dst_img = GATE_DIR / "images" / split / img_path.name
+            shutil.copy2(img_path, dst_img)
+
+            # Rewrite label with gate class id
+            dst_lbl = GATE_DIR / "labels" / split / f"{img_path.stem}.txt"
+            with open(lbl_path) as f:
+                lines = f.readlines()
+            new_lines = []
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) == 5:
+                    new_lines.append(f"{gate_cls} {' '.join(parts[1:])}")
+            with open(dst_lbl, "w") as f:
+                f.write("\n".join(new_lines))
+
+    write_pairs(trn_set, "train")
+    write_pairs(val_set, "val")
+
+    # Generate dataset.yaml
+    yaml_content = f"""path: {GATE_DIR.resolve()}
+train: images/train
+val:   images/val
+
+nc: 2
+names: ['traffic_light', 'pothole']
+"""
+    (GATE_DIR / "dataset.yaml").write_text(yaml_content)
+    print(f"  ✅ Gate dataset ready → {GATE_DIR}")
+    print(f"  ✅ Gate dataset.yaml generated")
+
+
 if __name__ == "__main__":
+    build_gate_dataset()
     main()

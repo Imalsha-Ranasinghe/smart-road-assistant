@@ -57,6 +57,16 @@ def get_models(use_aug=False):
             "name"    : "traffic_model",
             "save_as" : MODELS_DIR / "traffic_model.pt",
         },
+        
+        "gate": {
+        "weights" : BASE_DIR / "yolov8n.pt",    # nano — lightweight
+        "config"  : DATA_DIR / "gate_yolo" / "dataset.yaml",
+        "epochs"  : 50,
+        "imgsz"   : 640,
+        "batch"   : 16,
+        "name"    : "gate_model",
+        "save_as" : MODELS_DIR / "gate_model.pt",
+        },
     }
 
 
@@ -197,7 +207,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Smart Road Assistant models")
     parser.add_argument(
         "--model",
-        choices=["pothole", "traffic", "all"],
+        choices=["pothole", "traffic","gate", "all"],
         default="pothole",
         help="Which model to train (default: pothole)"
     )
