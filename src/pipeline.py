@@ -30,7 +30,8 @@ from analyzers.traffic_analyzer import TrafficLightAnalyzer
 
 # ── Paths ──────────────────────────────────────────────
 MODELS_DIR          = BASE_DIR / "models"
-DETECTOR_MODEL_PATH = MODELS_DIR / "detector_model.pt"
+DETECTOR_MODEL_PATH = MODELS_DIR / "detector_model.pt"           # photo page
+DASHCAM_MODEL_PATH  = MODELS_DIR / "detector_dashcam.pt"          # dashboard (video) — optional
 CONFIG_PATH         = BASE_DIR / "configs" / "pipeline_config.yaml"
 
 # ── Class IDs ──────────────────────────────────────────
@@ -147,7 +148,7 @@ class Pipeline:
         print("\nLoading Smart Road Assistant pipeline...")
         print("-" * 50)
 
-        # Stage 1
+        # Stage 1 — default detector (photo page)
         if not DETECTOR_MODEL_PATH.exists():
             print(f"  Detector model not found: {DETECTOR_MODEL_PATH}")
             print("  Run: python src/train.py --stage detector")
@@ -155,6 +156,16 @@ class Pipeline:
         else:
             self.detector = YOLO(str(DETECTOR_MODEL_PATH))
             print(f"  Stage 1 detector loaded  ({DETECTOR_MODEL_PATH.name})")
+
+        # Stage 1 — optional dashcam detector (dashboard / video page).
+        # Trained via notebooks/06-dashcam-detector.ipynb. Falls back to the
+        # default detector if it hasn't been trained yet.
+        if DASHCAM_MODEL_PATH.exists():
+            self.detector_dashcam = YOLO(str(DASHCAM_MODEL_PATH))
+            print(f"  Stage 1 dashcam detector loaded  ({DASHCAM_MODEL_PATH.name})")
+        else:
+            self.detector_dashcam = None
+            print("  Stage 1 dashcam detector not found — dashboard will use the default detector")
 
         self.detector_conf = float(cfg.get("detector_conf", 0.40))
 
@@ -175,14 +186,24 @@ class Pipeline:
 
     # ── Core inference ──────────────────────────────────
 
-    def run(self, frame: np.ndarray) -> dict:
+    def _select_detector(self, detector: str):
+        """Pick the detector for this request. 'dashcam' uses the dashcam model
+        if it has been trained, otherwise falls back to the default detector."""
+        if detector == "dashcam" and self.detector_dashcam is not None:
+            return self.detector_dashcam
+        return self.detector
+
+    def run(self, frame: np.ndarray, detector: str = "default") -> dict:
         """
         Process one BGR frame.
+
+        detector : "default" (photo model) or "dashcam" (video model w/ fallback)
 
         Returns dict:
             annotated_frame, warnings, potholes, traffic_lights
         """
-        if self.detector is None:
+        model = self._select_detector(detector)
+        if model is None:
             return {
                 "annotated_frame": frame.copy(),
                 "warnings":        ["Detector model not loaded."],
@@ -191,7 +212,7 @@ class Pipeline:
             }
 
         # Stage 1 — detect
-        preds = self.detector(frame, conf=self.detector_conf, verbose=False)
+        preds = model(frame, conf=self.detector_conf, verbose=False)
         boxes = preds[0].boxes
 
         potholes       = []
@@ -244,7 +265,7 @@ class Pipeline:
     # ── Video ───────────────────────────────────────────
 
     def run_video(self, video_path: str, output_path: str = None,
-                 progress_callback=None) -> dict:
+                 progress_callback=None, detector: str = "default") -> dict:
         """
         progress_callback(frames_done, frames_total, pct_float) called every 15 frames.
         """
@@ -267,7 +288,7 @@ class Pipeline:
             ret, frame = cap.read()
             if not ret:
                 break
-            result = self.run(frame)
+            result = self.run(frame, detector=detector)
             if writer:
                 writer.write(result["annotated_frame"])
             frame_count += 1

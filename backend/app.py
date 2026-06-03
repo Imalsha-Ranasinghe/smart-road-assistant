@@ -73,7 +73,7 @@ def serialize_traffic(d: dict) -> dict:
 
 @app.route("/health", methods=["GET"])
 def health():
-    from pipeline import DETECTOR_MODEL_PATH
+    from pipeline import DETECTOR_MODEL_PATH, DASHCAM_MODEL_PATH
     from analyzers.pothole_analyzer import SEVERITY_MODEL_PATH
     import yaml as _yaml
     severity_method = "auto"
@@ -84,6 +84,7 @@ def health():
     return jsonify({
         "status":           "ok",
         "detector_model":   DETECTOR_MODEL_PATH.exists(),
+        "dashcam_model":    DASHCAM_MODEL_PATH.exists(),
         "severity_model":   SEVERITY_MODEL_PATH.exists(),
         "severity_method":  severity_method,
     })
@@ -100,7 +101,9 @@ def detect_image():
     if frame is None:
         return jsonify({"error": "Could not decode image"}), 400
 
-    result = pipeline.run(frame)
+    # "default" (photo page) or "dashcam" (dashboard); falls back if untrained
+    detector = request.form.get("model", "default")
+    result = pipeline.run(frame, detector=detector)
 
     return jsonify({
         "annotated_image": frame_to_b64(result["annotated_frame"]),

@@ -1,5 +1,9 @@
 import { useMemo, useState, useRef, useCallback } from 'react';
 import './App.css';
+import { API_BASE, detectImage } from './api';
+import Dashboard from './Dashboard';
+
+const SEV_RANK = { High: 3, Medium: 2, Low: 1 };
 
 // ─── Pipeline stage definitions ───────────────────────────────────────────────
 const STAGES = [
@@ -49,53 +53,27 @@ const EMPTY_SUMMARY = {
   status:       'Ready',
   trafficLight: '—',
   pothole:      '—',
-  weather:      '—',
+  detections:   '—',
   warning:      'No active warnings',
 };
 
-// ─── Simulate pipeline phases ─────────────────────────────────────────────────
-function simulatePipeline(hasImage, onStageUpdate, onComplete) {
-  const trafficFound = Math.random() > 0.35;
-  const potholeFound = Math.random() > 0.35;
-  const tlState      = trafficFound ? ['Red', 'Yellow', 'Green'][Math.floor(Math.random() * 3)] : null;
-  const phSeverity   = potholeFound ? ['Low', 'Medium', 'High'][Math.floor(Math.random() * 3)]  : null;
-  const phDistance   = potholeFound ? ['Very Close', 'Close', 'Medium', 'Far'][Math.floor(Math.random() * 4)] : null;
-  const weathers     = ['Clear', 'Foggy', 'Rainy', 'Night'];
-  const weather      = weathers[Math.floor(Math.random() * weathers.length)];
-
-  const phases = [
-    { stages: ['input'],                               delay: 300  },
-    { stages: ['input','preprocess'],                  delay: 600  },
-    { stages: ['input','preprocess','gate'],            delay: 1000 },
-    {
-      stages: [
-        'input','preprocess','gate',
-        trafficFound ? 'traffic' : null,
-        potholeFound ? 'pothole' : null,
-      ].filter(Boolean),
-      delay: 1400,
-    },
-    {
-      stages: [
-        'input','preprocess','gate',
-        trafficFound ? 'traffic' : null,
-        potholeFound ? 'pothole' : null,
-        'postprocess','warning','output',
-      ].filter(Boolean),
-      delay: 1900,
-    },
-  ];
-
-  phases.forEach(({ stages, delay }) => {
-    setTimeout(() => onStageUpdate(stages), delay);
-  });
-
-  setTimeout(() => {
-    onComplete({ trafficFound, potholeFound, tlState, phSeverity, phDistance, weather });
-  }, 1900);
+// Pick the most important traffic light (lane-relevant first) and pothole (by severity)
+function summarize(data) {
+  const tls = data.traffic_lights ?? [];
+  const phs = data.potholes ?? [];
+  const primaryTl = tls.find(t => t.lane_relevant) ?? tls[0] ?? null;
+  const primaryPh = [...phs].sort(
+    (a, b) => (SEV_RANK[b.severity] ?? 0) - (SEV_RANK[a.severity] ?? 0),
+  )[0] ?? null;
+  return { tls, phs, primaryTl, primaryPh };
 }
 
 // ─── Warning banner helper ────────────────────────────────────────────────────
+// Mirrors the backend's generate_warnings(): lane-relevant traffic lights + all
+// potholes, but colour-coded by the model's actual outputs.
+const TL_COLOR_CLASS = { Red: 'red', Yellow: 'yellow', Green: 'green', Unknown: 'neutral' };
+const TL_ICON        = { Red: '🔴', Yellow: '🟡', Green: '🟢', Unknown: '🚦' };
+
 function WarningBanner({ result }) {
   if (!result) {
     return (
@@ -106,26 +84,22 @@ function WarningBanner({ result }) {
     );
   }
 
-  const { trafficFound, potholeFound, tlState, phSeverity, phDistance } = result;
   const items = [];
 
-  if (trafficFound) {
-    const colorClass = tlState === 'Red' ? 'red' : tlState === 'Yellow' ? 'yellow' : 'green';
-    const icon       = tlState === 'Red' ? '🔴' : tlState === 'Yellow' ? '🟡' : '🟢';
-    const msg        = tlState === 'Red'
-      ? 'STOP — Red traffic light detected!'
-      : tlState === 'Yellow'
-      ? 'SLOW DOWN — Yellow traffic light ahead.'
-      : 'Green light — Safe to proceed.';
-    items.push({ colorClass, icon, msg });
+  for (const t of (result.traffic_lights ?? []).filter(t => t.lane_relevant)) {
+    items.push({
+      colorClass: TL_COLOR_CLASS[t.color] ?? 'neutral',
+      icon:       TL_ICON[t.color] ?? '🚦',
+      msg:        t.instructions,
+    });
   }
 
-  if (potholeFound) {
-    const sev   = phSeverity;
-    const clr   = sev === 'High' ? 'red' : sev === 'Medium' ? 'orange' : 'yellow';
-    const icon  = '⚠️';
-    const msg   = `POTHOLE AHEAD — ${sev} severity, ${phDistance}.`;
-    items.push({ colorClass: clr, icon, msg });
+  for (const p of result.potholes ?? []) {
+    items.push({
+      colorClass: p.severity === 'High' ? 'red' : p.severity === 'Medium' ? 'orange' : 'yellow',
+      icon:       '⚠️',
+      msg:        p.instructions,
+    });
   }
 
   if (items.length === 0) {
@@ -149,12 +123,13 @@ function WarningBanner({ result }) {
   );
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
-export default function App() {
+// ─── Detection Pipeline page (single-image, full stage trace) ─────────────────
+function PipelinePage() {
   const [activeStages, setActiveStages]   = useState([]);
   const [running, setRunning]             = useState(false);
   const [summary, setSummary]             = useState(EMPTY_SUMMARY);
   const [result, setResult]               = useState(null);
+  const [error, setError]                 = useState(null);
   const [history, setHistory]             = useState([]);
   const [imageFile, setImageFile]         = useState(null);
   const [imagePreview, setImagePreview]   = useState(null);
@@ -167,6 +142,7 @@ export default function App() {
     setImageFile(file);
     setImagePreview(URL.createObjectURL(file));
     setResult(null);
+    setError(null);
     setActiveStages([]);
     setSummary(EMPTY_SUMMARY);
   }, []);
@@ -178,40 +154,56 @@ export default function App() {
     handleFile(e.dataTransfer.files[0]);
   };
 
-  // Run pipeline
-  const runPipeline = () => {
+  // Run pipeline — calls the real Flask backend (trained detector + severity models)
+  const runPipeline = async () => {
     if (!imageFile) return;
     setRunning(true);
     setResult(null);
-    setSummary({ status: 'Processing…', trafficLight: 'Scanning', pothole: 'Scanning', weather: 'Detecting', warning: 'Analyzing frame…' });
+    setError(null);
+    setActiveStages(['input', 'preprocess', 'gate']);
+    setSummary({ status: 'Processing…', trafficLight: 'Scanning', pothole: 'Scanning', detections: '…', warning: 'Analyzing frame…' });
 
-    simulatePipeline(
-      true,
-      (stages) => setActiveStages(stages),
-      ({ trafficFound, potholeFound, tlState, phSeverity, phDistance, weather }) => {
-        const tlLabel = trafficFound ? `Detected — ${tlState}` : 'Not detected';
-        const phLabel = potholeFound ? `Detected — ${phSeverity} severity, ${phDistance}` : 'Not detected';
+    try {
+      const data = await detectImage(imageFile);
+      const { tls, phs, primaryTl, primaryPh } = summarize(data);
 
-        setSummary({
-          status:       'Completed',
-          trafficLight: tlLabel,
-          pothole:      phLabel,
-          weather:      weather,
-          warning:      trafficFound || potholeFound ? 'Active warnings — see below' : 'No hazards detected',
-        });
+      // Reflect which branches actually ran in the stage tracker
+      const stages = ['input', 'preprocess', 'gate'];
+      if (tls.length) stages.push('traffic');
+      if (phs.length) stages.push('pothole');
+      stages.push('postprocess', 'warning', 'output');
+      setActiveStages(stages);
 
-        const r = { trafficFound, potholeFound, tlState, phSeverity, phDistance };
-        setResult(r);
-        setHistory(prev => [{
-          id:       Date.now(),
-          time:     new Date().toLocaleTimeString(),
-          traffic:  trafficFound ? tlState : '—',
-          pothole:  potholeFound ? phSeverity : '—',
-          weather,
-        }, ...prev].slice(0, 6));
-        setRunning(false);
-      }
-    );
+      const tlLabel = primaryTl
+        ? `${primaryTl.color}${primaryTl.lane_relevant ? '' : ' (adjacent)'}${tls.length > 1 ? ` +${tls.length - 1}` : ''}`
+        : 'Not detected';
+      const phLabel = primaryPh
+        ? `${primaryPh.severity} — ${primaryPh.distance}${phs.length > 1 ? ` +${phs.length - 1}` : ''}`
+        : 'Not detected';
+
+      setSummary({
+        status:       'Completed',
+        trafficLight: tlLabel,
+        pothole:      phLabel,
+        detections:   `${data.counts.potholes} PH · ${data.counts.traffic_lights} TL`,
+        warning:      (data.warnings?.length) ? 'Active warnings — see below' : 'No hazards detected',
+      });
+
+      setResult(data);
+      setHistory(prev => [{
+        id:      Date.now(),
+        time:    new Date().toLocaleTimeString(),
+        traffic: primaryTl ? primaryTl.color : '—',
+        pothole: primaryPh ? primaryPh.severity : '—',
+        counts:  `${data.counts.potholes + data.counts.traffic_lights} obj`,
+      }, ...prev].slice(0, 6));
+    } catch (e) {
+      setError(e.message || String(e));
+      setActiveStages([]);
+      setSummary({ status: 'Error', trafficLight: '—', pothole: '—', detections: '—', warning: 'Backend request failed' });
+    } finally {
+      setRunning(false);
+    }
   };
 
   const reset = () => {
@@ -219,6 +211,7 @@ export default function App() {
     setRunning(false);
     setSummary(EMPTY_SUMMARY);
     setResult(null);
+    setError(null);
     setImageFile(null);
     setImagePreview(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -337,7 +330,7 @@ export default function App() {
           <div className="stats-grid">
             {[
               { label: 'Status',        value: summary.status       },
-              { label: 'Weather',       value: summary.weather      },
+              { label: 'Detections',    value: summary.detections   },
               { label: 'Traffic Light', value: summary.trafficLight },
               { label: 'Pothole',       value: summary.pothole      },
             ].map(({ label, value }) => (
@@ -348,17 +341,28 @@ export default function App() {
             ))}
           </div>
 
-          {/* Annotated result image (reuses input until backend provides one) */}
-          {imagePreview && summary.status === 'Completed' && (
+          {/* Annotated result image — boxes + labels drawn by the backend pipeline */}
+          {result?.annotated_image && summary.status === 'Completed' && (
             <div className="result-section">
               <span className="preview-label">Annotated output</span>
-              <img src={imagePreview} alt="Annotated result" className="preview-img" />
+              <img
+                src={`data:image/jpeg;base64,${result.annotated_image}`}
+                alt="Annotated result"
+                className="preview-img"
+              />
             </div>
           )}
 
           {/* Warnings */}
           <div style={{ marginTop: '16px', marginBottom: '20px' }}>
-            <WarningBanner result={result} />
+            {error ? (
+              <div className="warning-banner red">
+                <span className="warning-icon">⛔</span>
+                <span>{error} — is the backend running at {API_BASE}? Start it with: python backend/app.py</span>
+              </div>
+            ) : (
+              <WarningBanner result={result} />
+            )}
           </div>
 
           {/* History */}
@@ -371,7 +375,7 @@ export default function App() {
                 {history.map(run => (
                   <li key={run.id} className="history-item">
                     <span className="history-text">
-                      TL: <strong>{run.traffic}</strong> &nbsp;·&nbsp; PH: <strong>{run.pothole}</strong> &nbsp;·&nbsp; {run.weather}
+                      TL: <strong>{run.traffic}</strong> &nbsp;·&nbsp; PH: <strong>{run.pothole}</strong> &nbsp;·&nbsp; {run.counts}
                     </span>
                     <span className="history-time">{run.time}</span>
                   </li>
@@ -382,6 +386,35 @@ export default function App() {
 
         </aside>
       </main>
+    </div>
+  );
+}
+
+// ─── Root: nav shell switching between Dashboard and Pipeline ──────────────────
+export default function App() {
+  const [page, setPage] = useState('dashboard');
+
+  return (
+    <div className="app-root">
+      <nav className="app-nav">
+        <span className="app-nav-brand">🛣️ Smart Road Assistant</span>
+        <div className="app-nav-tabs">
+          <button
+            className={page === 'dashboard' ? 'active' : ''}
+            onClick={() => setPage('dashboard')}
+          >
+            Dashboard
+          </button>
+          <button
+            className={page === 'pipeline' ? 'active' : ''}
+            onClick={() => setPage('pipeline')}
+          >
+            Detection Pipeline
+          </button>
+        </div>
+      </nav>
+
+      {page === 'dashboard' ? <Dashboard /> : <PipelinePage />}
     </div>
   );
 }

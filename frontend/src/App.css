@@ -59,6 +59,45 @@ body::before {
   z-index: 1000;
 }
 
+/* ─── Top navigation (Dashboard / Pipeline) ─── */
+.app-nav {
+  position: sticky;
+  top: 0;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 58px;
+  padding: 0 24px;
+  background: rgba(9, 12, 18, 0.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.app-nav-brand {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text-1);
+}
+.app-nav-tabs { display: flex; gap: 8px; }
+.app-nav-tabs button {
+  padding: 8px 18px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.app-nav-tabs button:hover { color: var(--text-1); background: var(--bg-hover); }
+.app-nav-tabs button.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
 /* ─── Shell ─── */
 .app-shell {
   max-width: 1380px;
