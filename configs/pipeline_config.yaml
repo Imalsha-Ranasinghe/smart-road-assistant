@@ -2,7 +2,7 @@
 # The severity_method line is overwritten by benchmark_severity.py after training.
 # Edit other values to tune runtime behaviour.
 
-severity_method: auto      # "cv" | "cnn" | "auto"  (auto = cnn if model exists)
+severity_method: cnn
 
 detector_conf:       0.40  # Stage 1 confidence threshold
 nms_iou:             0.45  # NMS IoU threshold (used by YOLO internally)

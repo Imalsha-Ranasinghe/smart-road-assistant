@@ -243,7 +243,11 @@ class Pipeline:
 
     # ── Video ───────────────────────────────────────────
 
-    def run_video(self, video_path: str, output_path: str = None) -> dict:
+    def run_video(self, video_path: str, output_path: str = None,
+                 progress_callback=None) -> dict:
+        """
+        progress_callback(frames_done, frames_total, pct_float) called every 15 frames.
+        """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Cannot open video: {video_path}")
@@ -267,15 +271,19 @@ class Pipeline:
             if writer:
                 writer.write(result["annotated_frame"])
             frame_count += 1
-            if frame_count % 30 == 0:
+            if frame_count % 15 == 0:
                 pct = (frame_count / total * 100) if total else 0
+                if progress_callback:
+                    progress_callback(frame_count, total, pct)
                 print(f"  {frame_count}/{total} frames ({pct:.0f}%)...")
 
         cap.release()
         if writer:
             writer.release()
+        if progress_callback:
+            progress_callback(frame_count, total, 100.0)
         print(f"  Done → {output_path}  ({frame_count} frames)")
-        return {"frame_count": frame_count, "output": output_path}
+        return {"frame_count": frame_count, "total_frames": total, "output": output_path}
 
     # ── Webcam ──────────────────────────────────────────
 
