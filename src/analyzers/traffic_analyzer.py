@@ -110,7 +110,59 @@ class TrafficLightAnalyzer:
             "instructions":     _INSTRUCTIONS[color][lane_relevant],
         }
 
-    # ── Lane relevance ────────────────────────────────
+    # ── Lane focus: pick THE light governing our lane (cross-box) ─────────────
+
+    def select_lane_relevant(self, lights: list, frame: np.ndarray) -> float:
+        """Among all detected traffic lights, mark the single one governing our lane.
+
+        Scores each plausible light by closeness (box size) + centrality to the
+        road vanishing point (so it follows curves/turns) + height + confidence,
+        then flags the top one as lane_relevant and the rest as not. Updates each
+        light's lane_relevant / lane_score / instructions in place.
+        Returns the vanishing-point x that was used.
+        """
+        h, w = frame.shape[:2]
+        vp = _estimate_vanishing_x(frame)
+        corridor = ((self.lane_x_max - self.lane_x_min) / 2.0) * w   # half-width around VP
+
+        for d in lights:
+            d["lane_relevant"] = False
+            d["lane_score"]    = 0.0
+
+        # Candidates: real, close-enough signals inside the lane corridor (around VP)
+        cands = []
+        for d in lights:
+            x1, y1, x2, y2 = d["box"]
+            bw, bh = max(x2 - x1, 1), max(y2 - y1, 1)
+            size_ratio = (bw * bh) / max(w * h, 1)
+            aspect     = bh / bw
+            xc         = (x1 + x2) / 2.0
+            if size_ratio < self.lane_min_size or aspect < self.lane_min_aspect:
+                continue
+            if abs(xc - vp) > corridor:
+                continue
+            cands.append((d, size_ratio, xc, (y1 + y2) / 2.0))
+
+        if cands:
+            max_size = max(c[1] for c in cands)
+            for d, size_ratio, xc, yc in cands:
+                centrality = 1.0 - min(abs(xc - vp) / (w / 2.0), 1.0)
+                d["lane_score"] = round(
+                    0.45 * (size_ratio / max_size)   # closeness — the light you're nearing
+                    + 0.35 * centrality              # aligned with the road ahead (VP)
+                    + 0.05 * (1.0 - yc / h)          # mounted high
+                    + 0.15 * d.get("conf", 0.5),     # detector confidence
+                    3)
+            best = max((c[0] for c in cands), key=lambda d: d["lane_score"])
+            best["lane_relevant"] = True
+
+        # keep instructions consistent with the (possibly) updated relevance
+        for d in lights:
+            color = d.get("color", "Unknown")
+            d["instructions"] = _INSTRUCTIONS.get(color, _INSTRUCTIONS["Unknown"])[d["lane_relevant"]]
+        return vp
+
+    # ── Lane relevance (per-box geometry gate) ────────────
 
     def _check_lane_relevance(self, box: list, frame_shape: tuple) -> bool:
         frame_h, frame_w = frame_shape[:2]
