@@ -8,6 +8,8 @@ const ANALYZE_GAP_MS = 200;
 const JPEG_QUALITY = 0.6;
 // Only speak alerts at or above this priority score.
 const SPEAK_MIN_SCORE = 60;
+// Avoid filling history with the same detection on every analyzed frame.
+const HISTORY_REPEAT_GAP_MS = 2000;
 
 // Turn a backend result into a priority-sorted list of driver alerts.
 // Mirrors the backend's generate_warnings(): lane-relevant lights + all potholes.
@@ -41,6 +43,10 @@ function buildAlerts(data) {
   return out.sort((a, b) => b.score - a.score);
 }
 
+function formatClockTime(date = new Date()) {
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
 export default function Dashboard() {
   const videoRef   = useRef(null);
   const overlayRef = useRef(null);   // canvas drawn over the video (boxes)
@@ -51,11 +57,13 @@ export default function Dashboard() {
   const inFlightRef = useRef(false); // a request is currently pending
   const mutedRef    = useRef(false); // read inside the loop without stale state
   const lastSpokenRef = useRef('');
+  const lastHistoryRef = useRef({ key: '', at: 0 });
 
   const [videoUrl, setVideoUrl]   = useState(null);
   const [playing, setPlaying]     = useState(false);
   const [ended, setEnded]         = useState(false);
   const [latest, setLatest]       = useState(null);
+  const [alertHistory, setAlertHistory] = useState([]);
   const [error, setError]         = useState(null);
   const [muted, setMuted]         = useState(false);
   const [latencyMs, setLatencyMs] = useState(0);
@@ -117,6 +125,26 @@ export default function Dashboard() {
     }
   };
 
+  const recordAlertHistory = (data) => {
+    const top = buildAlerts(data)[0];
+    if (!top) return;
+
+    const now = Date.now();
+    const key = `${top.title}|${top.msg}`;
+    const last = lastHistoryRef.current;
+    if (last.key === key && now - last.at < HISTORY_REPEAT_GAP_MS) return;
+
+    lastHistoryRef.current = { key, at: now };
+    setAlertHistory(prev => [{
+      id: now,
+      time: formatClockTime(new Date(now)),
+      icon: top.icon,
+      title: top.title,
+      msg: top.msg,
+      colorClass: top.colorClass,
+    }, ...prev].slice(0, 6));
+  };
+
   const analyzeOnce = async () => {
     const v = videoRef.current, cap = captureRef.current;
     if (!v || !cap || v.readyState < 2 || !v.videoWidth) return;
@@ -129,6 +157,7 @@ export default function Dashboard() {
     const data = await detectImage(blob, 'frame.jpg', 'dashcam');  // use dashcam model (falls back if untrained)
     setLatencyMs(Math.round(performance.now() - t0));
     setLatest(data);
+    recordAlertHistory(data);
     drawOverlay(data);
     speak(data);
   };
@@ -165,12 +194,15 @@ export default function Dashboard() {
     if (!file || !file.type.startsWith('video/')) return;
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     setVideoUrl(URL.createObjectURL(file));
-    setLatest(null); setError(null); setEnded(false);
+    setLatest(null); setAlertHistory([]); lastHistoryRef.current = { key: '', at: 0 };
+    setError(null); setEnded(false);
   };
   const changeVideo = () => {
     loopRef.current = false; window.speechSynthesis?.cancel();
     if (videoUrl) URL.revokeObjectURL(videoUrl);
-    setVideoUrl(null); setLatest(null); setError(null); setPlaying(false); setEnded(false);
+    setVideoUrl(null); setLatest(null); setAlertHistory([]);
+    lastHistoryRef.current = { key: '', at: 0 };
+    setError(null); setPlaying(false); setEnded(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -186,6 +218,7 @@ export default function Dashboard() {
 
   const tl = (latest?.traffic_lights ?? []).find(t => t.lane_relevant)
           ?? (latest?.traffic_lights ?? [])[0] ?? null;
+  const previousAlerts = alertHistory.slice(1, 6);
 
   return (
     <div className="dash">
@@ -266,6 +299,21 @@ export default function Dashboard() {
               ))}
               {alerts.length <= 1 && !error && (
                 <div className="dash-chip muted">No other hazards</div>
+              )}
+            </div>
+
+            <div className="dash-history">
+              <div className="dash-history-title">Previous alerts</div>
+              {previousAlerts.length ? (
+                previousAlerts.map(item => (
+                  <div key={item.id} className={`dash-history-row ${item.colorClass}`}>
+                    <span className="dash-history-time">{item.time}</span>
+                    <span className="dash-history-icon">{item.icon}</span>
+                    <span className="dash-history-text">{item.title}</span>
+                  </div>
+                ))
+              ) : (
+                <div className="dash-history-empty">No previous alerts</div>
               )}
             </div>
           </aside>
