@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect } from 'react';
 import { detectImage, API_BASE } from './api';
+import * as audioWarnings from './audioWarnings';
 import './Dashboard.css';
 
 // How long to wait between analysis cycles (backend latency usually dominates).
@@ -7,7 +8,9 @@ const ANALYZE_GAP_MS = 200;
 // JPEG quality for the captured frame — lower = smaller upload = faster round-trip.
 const JPEG_QUALITY = 0.6;
 // Only speak alerts at or above this priority score.
-const SPEAK_MIN_SCORE = 60;
+// Set to 30 so all pothole severities and traffic light colors are spoken.
+// Unknown/unclear signals (score 20) are intentionally excluded.
+const SPEAK_MIN_SCORE = 30;
 // Avoid filling history with the same detection on every analyzed frame.
 const HISTORY_REPEAT_GAP_MS = 2000;
 
@@ -21,6 +24,7 @@ function buildAlerts(data) {
     const score = t.color === 'Red' ? 100 : t.color === 'Yellow' ? 70 : t.color === 'Green' ? 40 : 20;
     out.push({
       score,
+      key:        audioWarnings.trafficKey(t),
       colorClass: t.color === 'Red' ? 'red' : t.color === 'Yellow' ? 'yellow' : t.color === 'Green' ? 'green' : 'neutral',
       icon:       t.color === 'Red' ? '🛑' : t.color === 'Yellow' ? '🚦' : t.color === 'Green' ? '✅' : '🚦',
       title:      `${t.color} light ahead`,
@@ -33,6 +37,7 @@ function buildAlerts(data) {
     const bonus = p.distance === 'Very Close' ? 8 : p.distance === 'Close' ? 5 : p.distance === 'Medium' ? 2 : 0;
     out.push({
       score:      base + bonus,
+      key:        audioWarnings.potholeKey(p),
       colorClass: p.severity === 'High' ? 'red' : p.severity === 'Medium' ? 'orange' : 'yellow',
       icon:       '⚠️',
       title:      `${p.severity} pothole · ${p.distance}`,
@@ -71,12 +76,13 @@ export default function Dashboard() {
 
   useEffect(() => {
     mutedRef.current = muted;
-    if (muted) window.speechSynthesis?.cancel();
+    if (muted) { audioWarnings.stop(); window.speechSynthesis?.cancel(); }
   }, [muted]);
 
   // Stop everything when leaving the page.
   useEffect(() => () => {
     loopRef.current = false;
+    audioWarnings.stop();
     window.speechSynthesis?.cancel();
   }, []);
 
@@ -111,17 +117,22 @@ export default function Dashboard() {
   };
 
   const speak = (data) => {
-    if (mutedRef.current || !('speechSynthesis' in window)) return;
-    const top  = buildAlerts(data)[0];
-    const text = top && top.score >= SPEAK_MIN_SCORE ? top.msg : '';
-    if (text && text !== lastSpokenRef.current) {
-      lastSpokenRef.current = text;
-      const u = new SpeechSynthesisUtterance(text);
+    if (mutedRef.current) return;
+    const top = buildAlerts(data)[0];
+    if (!top || top.score < SPEAK_MIN_SCORE) {
+      lastSpokenRef.current = '';   // allow re-announcing when a hazard returns
+      return;
+    }
+    if (top.key === lastSpokenRef.current) return;  // already announced this one
+    lastSpokenRef.current = top.key;
+
+    // Try local audio first; fall back to browser speechSynthesis if file not ready
+    const played = audioWarnings.play(top.key);
+    if (!played && 'speechSynthesis' in window) {
+      const u = new SpeechSynthesisUtterance(top.msg);
       u.rate = 1.05;
       window.speechSynthesis.cancel();
       window.speechSynthesis.speak(u);
-    } else if (!text) {
-      lastSpokenRef.current = '';   // allow re-announcing when a hazard returns
     }
   };
 
@@ -183,7 +194,7 @@ export default function Dashboard() {
   const handleEnded = () => {
     setPlaying(false); setEnded(true);
     loopRef.current = false; lastSpokenRef.current = '';
-    window.speechSynthesis?.cancel();
+    audioWarnings.stop(); window.speechSynthesis?.cancel();
   };
 
   const togglePlay = () => { const v = videoRef.current; if (v) v.paused ? v.play() : v.pause(); };
@@ -198,7 +209,7 @@ export default function Dashboard() {
     setError(null); setEnded(false);
   };
   const changeVideo = () => {
-    loopRef.current = false; window.speechSynthesis?.cancel();
+    loopRef.current = false; audioWarnings.stop(); window.speechSynthesis?.cancel();
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     setVideoUrl(null); setLatest(null); setAlertHistory([]);
     lastHistoryRef.current = { key: '', at: 0 };

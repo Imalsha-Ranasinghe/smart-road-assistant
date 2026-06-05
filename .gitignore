@@ -22,6 +22,9 @@ output_annotated.mp4
 *_detected.jpg
 backend/uploads/
 
+# ─── Generated audio warnings (regenerate with generate_audio.py) ────────────
+frontend/public/audio/*.mp3
+
 # ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
