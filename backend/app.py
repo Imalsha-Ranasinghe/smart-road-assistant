@@ -110,6 +110,7 @@ def detect_image():
         "warnings":        result["warnings"],
         "potholes":        [serialize_pothole(d) for d in result["potholes"]],
         "traffic_lights":  [serialize_traffic(d) for d in result["traffic_lights"]],
+        "lane":            result.get("lane"),
         "counts": {
             "potholes":       len(result["potholes"]),
             "traffic_lights": len(result["traffic_lights"]),

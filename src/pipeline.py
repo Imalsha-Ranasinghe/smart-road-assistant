@@ -15,6 +15,7 @@ Usage:
 """
 
 import sys
+import time
 import cv2
 import numpy as np
 import yaml
@@ -26,7 +27,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analyzers.pothole_analyzer import PotholeAnalyzer
-from analyzers.traffic_analyzer import TrafficLightAnalyzer
+from analyzers.traffic_analyzer import TrafficLightAnalyzer, detect_lane, default_roi_lane
+
+# How long (seconds) to reuse the last detected lane on video when a frame has none
+LANE_MEMORY_TTL = 1.0
 
 # ── Paths ──────────────────────────────────────────────
 MODELS_DIR          = BASE_DIR / "models"
@@ -37,6 +41,10 @@ CONFIG_PATH         = BASE_DIR / "configs" / "pipeline_config.yaml"
 # ── Class IDs ──────────────────────────────────────────
 CLS_POTHOLE = 0
 CLS_TRAFFIC = 1
+
+# ── Traffic-light temporal confirmation (video) ────────
+TL_CONFIRM_FRAMES = 3     # a tracked light must persist this many frames...
+TL_CONFIRM_CONF   = 0.50  # ...unless it is already this confident
 
 # ── Draw colors ────────────────────────────────────────
 COLOR_POTHOLE = (0, 140, 255)    # orange
@@ -55,6 +63,9 @@ def _load_config() -> dict:
     defaults = {
         "severity_method":     "auto",
         "detector_conf":       0.40,
+        "detector_imgsz":      640,
+        "video_imgsz":         1280,
+        "pothole_conf":        0.40,
         "lane_x_min":          0.20,
         "lane_x_max":          0.80,
         "lane_min_size_ratio": 0.001,
@@ -117,6 +128,48 @@ def draw_detections(frame, potholes, traffic_lights):
     return out
 
 
+def draw_lane(frame, lane):
+    """Draw the ego-lane edges: a confident detection is solid green (curved when
+    a polyline is available); the fixed-ROI fallback is a thinner amber corridor."""
+    assumed = lane.get("assumed")
+    color = (0, 200, 220) if assumed else (0, 220, 0)
+    thick = 2 if assumed else 3
+    for key in ("left", "right"):
+        poly = lane.get(key + "_poly")
+        if poly and len(poly) >= 2:
+            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [pts], False, color, thick)
+            continue
+        seg = lane.get(key)
+        if not seg:
+            continue
+        x1, y1, x2, y2 = seg
+        cv2.line(frame, (x1, y1), (x2, y2), color, thick)
+
+
+def pothole_in_lane(box, lane):
+    """True if the pothole's road-contact point (bottom-centre of its box) lies
+    between the lane's left and right edge lines — i.e. inside the lane corridor
+    that converges at the vanishing point."""
+    L, R = lane.get("left"), lane.get("right")
+    if not L or not R:
+        return True                         # no corridor defined → don't filter
+
+    def x_at(line, y):
+        x1, y1, x2, y2 = line
+        if y2 == y1:
+            return x1
+        return x1 + (y - y1) / (y2 - y1) * (x2 - x1)
+
+    cx = (box[0] + box[2]) / 2.0
+    cy = box[3]                             # bottom of the box = contact with the road
+    top_y = min(L[3], R[3])
+    if cy < top_y:                          # above the corridor apex → too far / off-road
+        return False
+    lx, rx = x_at(L, cy), x_at(R, cy)
+    return min(lx, rx) <= cx <= max(lx, rx)
+
+
 def generate_warnings(potholes, traffic_lights):
     warnings = []
     for det in traffic_lights:
@@ -167,7 +220,10 @@ class Pipeline:
             self.detector_dashcam = None
             print("  Stage 1 dashcam detector not found — dashboard will use the default detector")
 
-        self.detector_conf = float(cfg.get("detector_conf", 0.40))
+        self.detector_conf  = float(cfg.get("detector_conf", 0.40))
+        self.detector_imgsz = int(cfg.get("detector_imgsz", 640))    # photo page
+        self.video_imgsz    = int(cfg.get("video_imgsz", 1280))      # video page (small objects)
+        self.pothole_conf   = float(cfg.get("pothole_conf", 0.40))
 
         # Stage 2a
         severity_method = cfg.get("severity_method", "auto")
@@ -184,7 +240,34 @@ class Pipeline:
         print("  Stage 2b TrafficLightAnalyzer (classical CV)")
         print("-" * 50 + "\n")
 
+        # Last detected lane, for temporal persistence on video
+        self._last_lane = None        # (vp_x, lane_lines)
+        self._last_lane_t = 0.0
+
+        # track_id → consecutive frames seen (video traffic-light FP filter)
+        self._tl_hits = {}
+
     # ── Core inference ──────────────────────────────────
+
+    def _resolve_lane(self, frame, detector):
+        """Layered lane resolution:
+        1. detected lane lines  →  2. last-known lane (video, ~1s)  →  3. fixed ROI.
+        Returns (vp_x, lane_lines, assumed) where `assumed` flags the ROI fallback.
+        """
+        vp_x, _vp_y, lane_lines, _segs = detect_lane(frame)
+        if lane_lines is not None:
+            if detector == "dashcam":
+                self._last_lane = (vp_x, lane_lines)
+                self._last_lane_t = time.time()
+            return vp_x, lane_lines, False
+
+        # No lines this frame: reuse the recent lane on video, else fixed ROI
+        if (detector == "dashcam" and self._last_lane is not None
+                and time.time() - self._last_lane_t <= LANE_MEMORY_TTL):
+            return self._last_lane[0], self._last_lane[1], False
+
+        roi_vp, roi_lane = default_roi_lane(frame.shape)
+        return roi_vp, roi_lane, True
 
     def _select_detector(self, detector: str):
         """Pick the detector for this request. 'dashcam' uses the dashcam model
@@ -193,11 +276,16 @@ class Pipeline:
             return self.detector_dashcam
         return self.detector
 
-    def run(self, frame: np.ndarray, detector: str = "default") -> dict:
+    def run(self, frame: np.ndarray, detector: str = "default",
+            track: bool = False, reset_track: bool = False,
+            imgsz: int = None) -> dict:
         """
         Process one BGR frame.
 
-        detector : "default" (photo model) or "dashcam" (video model w/ fallback)
+        detector    : "default" (photo model) or "dashcam" (video model w/ fallback)
+        track       : use ByteTrack to associate detections across frames (video).
+                      Smooths flicker and recovers objects that briefly dip below conf.
+        reset_track : start a fresh tracker (pass True on the first frame of a video).
 
         Returns dict:
             annotated_frame, warnings, potholes, traffic_lights
@@ -209,10 +297,25 @@ class Pipeline:
                 "warnings":        ["Detector model not loaded."],
                 "potholes":        [],
                 "traffic_lights":  [],
+                "lane":            None,
             }
 
-        # Stage 1 — detect
-        preds = model(frame, conf=self.detector_conf, verbose=False)
+        # Fresh tracker state at the start of each video
+        if track and reset_track:
+            self._tl_hits = {}
+
+        # Stage 1 — detect (optionally with temporal tracking on video)
+        eff_imgsz = imgsz if imgsz else self.detector_imgsz
+        if track:
+            preds = model.track(
+                frame, conf=self.detector_conf, imgsz=eff_imgsz,
+                persist=not reset_track, tracker="bytetrack.yaml", verbose=False,
+            )
+        else:
+            preds = model(
+                frame, conf=self.detector_conf, imgsz=eff_imgsz,
+                verbose=False,
+            )
         boxes = preds[0].boxes
 
         potholes       = []
@@ -223,6 +326,7 @@ class Pipeline:
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
                 cls  = int(box.cls[0])
                 conf = float(box.conf[0])
+                tid  = int(box.id[0]) if getattr(box, "id", None) is not None else None
 
                 # Guard against zero-area crops
                 if x2 <= x1 or y2 <= y1:
@@ -231,14 +335,48 @@ class Pipeline:
                 coords = [x1, y1, x2, y2]
 
                 if cls == CLS_POTHOLE:
+                    # Potholes use a stricter threshold than traffic lights so the
+                    # lowered detector_conf doesn't flood the road with FPs.
+                    if conf < self.pothole_conf:
+                        continue
                     analysis = self.pothole_analyzer.analyze(crop, coords, frame.shape)
                     potholes.append({"box": coords, "conf": conf, **analysis})
 
                 elif cls == CLS_TRAFFIC:
                     analysis = self.traffic_analyzer.analyze(crop, coords, frame.shape)
-                    traffic_lights.append({"box": coords, "conf": conf, **analysis})
+                    traffic_lights.append({"box": coords, "conf": conf,
+                                           "track_id": tid, **analysis})
+
+        # Resolve the road: detected lane lines → last-known (video) → fixed ROI.
+        vp_x, lane_lines, lane_assumed = self._resolve_lane(frame, detector)
+        lane = {**lane_lines, "confident": True, "assumed": lane_assumed}
+
+        # Reject false positives, then keep ONLY the single light governing the
+        # driver's lane (nearest + most aligned with the road ahead).
+        if traffic_lights:
+            self.traffic_analyzer.select_lane_relevant(traffic_lights, frame, vp=vp_x)
+            traffic_lights = [t for t in traffic_lights if t["lane_relevant"]]
+
+            # On video, require a tracked light to persist a few frames before we
+            # trust it — drops 1–2 frame false positives. A high-confidence
+            # detection is shown immediately.
+            if track and traffic_lights:
+                t   = traffic_lights[0]
+                tid = t.get("track_id")
+                if tid is not None:
+                    self._tl_hits[tid] = self._tl_hits.get(tid, 0) + 1
+                    if (self._tl_hits[tid] < TL_CONFIRM_FRAMES
+                            and t["conf"] < TL_CONFIRM_CONF):
+                        traffic_lights = []
+
+        # Keep only potholes inside the detected lane corridor (between the green
+        # lines). Skipped when the lane is just the assumed ROI (no real lines).
+        if potholes and not lane["assumed"] and lane.get("left") and lane.get("right"):
+            potholes = [d for d in potholes if pothole_in_lane(d["box"], lane)]
 
         annotated = draw_detections(frame, potholes, traffic_lights)
+        if lane:
+            draw_lane(annotated, lane)
         warnings  = generate_warnings(potholes, traffic_lights)
 
         return {
@@ -246,6 +384,7 @@ class Pipeline:
             "warnings":        warnings,
             "potholes":        potholes,
             "traffic_lights":  traffic_lights,
+            "lane":            lane,
         }
 
     # ── Image ───────────────────────────────────────────
@@ -288,7 +427,12 @@ class Pipeline:
             ret, frame = cap.read()
             if not ret:
                 break
-            result = self.run(frame, detector=detector)
+            # Temporal tracking (ByteTrack) smooths flicker and recovers objects
+            # that briefly dip below conf. reset_track on the first frame starts a
+            # fresh tracker for this video. Video uses the larger video_imgsz so
+            # small/distant lights and potholes are detected.
+            result = self.run(frame, detector=detector, track=True,
+                              reset_track=(frame_count == 0), imgsz=self.video_imgsz)
             if writer:
                 writer.write(result["annotated_frame"])
             frame_count += 1

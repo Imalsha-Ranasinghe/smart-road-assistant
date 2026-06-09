@@ -28,14 +28,16 @@ BASE_DIR     = Path(__file__).resolve().parent.parent
 RAW          = BASE_DIR / "data" / "raw"
 DATASET_DIR  = BASE_DIR / "data" / "processed" / "dashcam_yolo"
 MODELS_DIR   = BASE_DIR / "models"
-EXISTING_DET = BASE_DIR / "data" / "processed" / "detector_yolo"   # for traffic reuse
+EXISTING_DET = BASE_DIR / "data" / "processed" / "detector_yolo"   # far traffic reuse
+KAGGLE_DIR   = BASE_DIR / "data" / "raw" / "traffic" / "kaggle"     # near traffic (--kaggle)
 IMG_EXTS     = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 random.seed(42)
 
 # Road-level / dashcam pothole datasets to include (each: data.yaml + train/valid/test).
 EXTERNAL_DATASETS = [
-    RAW / "pothole" / "0-No-dcs-aug.v1i.yolov8",       # dashcam view ✔ (multi-class)
-    # RAW / "pothole" / "Pothole Peddal.v2i.yolov8",   # skipped: close-up, not dashcam
+    RAW / "pothole" / "0-No-dcs-aug.v1i.yolov8",       # dashcam view ✔ (small/distant, bbox)
+    RAW / "pothole" / "dashcam.pothole",               # large/close potholes (segmentation → bbox)
+    # RAW / "pothole" / "Pothole Peddal.v2i.yolov8",   # close-up only; the above covers large
 ]
 OWN_FRAMES = RAW / "dashcam_pseudo"   # your corrected pseudo-labels (Step 2b in the notebook)
 
@@ -75,9 +77,22 @@ def collect_potholes() -> list:
                 img = imgs.get(lbl.stem)
                 if img is None:
                     continue
-                out = ["0 " + " ".join(l.split()[1:])
-                       for l in lbl.read_text().splitlines()
-                       if len(l.split()) == 5 and int(l.split()[0]) == pidx]
+                out = []
+                for l in lbl.read_text().splitlines():
+                    p = l.split()
+                    if len(p) < 5 or int(p[0]) != pidx:
+                        continue
+                    c = list(map(float, p[1:]))
+                    if len(c) == 4:                              # bounding box
+                        cx, cy, bw, bh = c
+                    elif len(c) >= 6 and len(c) % 2 == 0:        # polygon → bbox
+                        xs, ys = c[0::2], c[1::2]
+                        x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
+                        cx, cy, bw, bh = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
+                    else:
+                        continue
+                    if bw > 0 and bh > 0:
+                        out.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
                 if out:
                     items.append((img, out))
                     n += 1
@@ -121,6 +136,42 @@ def collect_traffic(limit: int) -> list:
     return items
 
 
+def collect_kaggle() -> list:
+    """Parse the kaggle JSON (near intersection footage) → traffic_light (class 1)."""
+    import json
+    from collections import defaultdict
+    from PIL import Image
+    root = KAGGLE_DIR / "train_dataset"
+    jf = root / "train.json"
+    if not jf.exists():
+        print("  kaggle: train.json missing"); return []
+    by_file = defaultdict(list)
+    for a in json.load(jf.open()).get("annotations", []):
+        b = a.get("bndbox")
+        if b:
+            by_file[a["filename"]].append(b)
+    items = []
+    for fn, boxes in by_file.items():
+        img = root / fn.replace("\\", "/")
+        if not img.exists():
+            continue
+        try:
+            W, H = Image.open(img).size
+        except Exception:
+            continue
+        out = []
+        for b in boxes:
+            x1, y1, x2, y2 = b["xmin"], b["ymin"], b["xmax"], b["ymax"]
+            bw, bh = (x2 - x1) / W, (y2 - y1) / H
+            if bw <= 0 or bh <= 0:
+                continue
+            out.append(f"1 {((x1+x2)/2)/W:.6f} {((y1+y2)/2)/H:.6f} {bw:.6f} {bh:.6f}")
+        if out:
+            items.append((img, out))
+    print(f"  kaggle: +{len(items)} traffic images (near)")
+    return items
+
+
 def assemble(items: list, classes: list, val_frac: float = 0.15):
     if DATASET_DIR.exists():
         shutil.rmtree(DATASET_DIR)
@@ -159,7 +210,9 @@ def main():
     ap.add_argument("--frames", action="store_true",
                     help="Also include your own labelled frames from data/raw/dashcam_pseudo.")
     ap.add_argument("--traffic-limit", type=int, default=3000,
-                    help="Cap reused traffic_light images (balance vs potholes). Default 3000.")
+                    help="Cap reused far traffic_light images (balance vs potholes). Default 3000.")
+    ap.add_argument("--kaggle", action="store_true",
+                    help="Include the kaggle NEAR traffic-light set (data/raw/traffic/kaggle).")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--prep-only", action="store_true",
@@ -177,6 +230,8 @@ def main():
         items += collect_own_frames()
     if use_traffic:
         items += collect_traffic(args.traffic_limit)
+        if args.kaggle:
+            items += collect_kaggle()
 
     if not items:
         print("\nNo data collected — check EXTERNAL_DATASETS paths.")

@@ -97,6 +97,23 @@ export default function Dashboard() {
     ctx.clearRect(0, 0, c.width, c.height);
 
     const sx = dispW / v.videoWidth, sy = dispH / v.videoHeight;
+
+    // Lane edge lines (the road the vehicle is following) — drawn behind the boxes.
+    // Detected lanes = solid green; fixed-ROI fallback (no lines) = dashed amber.
+    const lane = data.lane;
+    if (lane && lane.confident) {
+      ctx.strokeStyle = lane.assumed ? 'rgba(0, 200, 220, 0.85)' : 'rgba(0, 220, 0, 0.9)';
+      ctx.lineWidth = lane.assumed ? 2 : 3;
+      ctx.setLineDash(lane.assumed ? [10, 8] : []);
+      for (const key of ['left', 'right']) {
+        const seg = lane[key];
+        if (!seg) continue;
+        const [x1, y1, x2, y2] = seg;
+        ctx.beginPath(); ctx.moveTo(x1 * sx, y1 * sy); ctx.lineTo(x2 * sx, y2 * sy); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
+
     const box = (b, color, label) => {
       const x = b[0] * sx, y = b[1] * sy, w = (b[2] - b[0]) * sx, h = (b[3] - b[1]) * sy;
       ctx.lineWidth = 3; ctx.strokeStyle = color; ctx.strokeRect(x, y, w, h);

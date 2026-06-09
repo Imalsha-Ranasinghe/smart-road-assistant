@@ -4,7 +4,10 @@
 
 severity_method: cnn
 
-detector_conf:       0.40  # Stage 1 confidence threshold
+detector_conf:       0.35  # Stage 1 confidence threshold (lowered from 0.40 to recover near/mid lights)
+detector_imgsz:      640   # Photo page inference size (close-up potholes — 640 is best for them)
+video_imgsz:         1280  # Video page inference size (small/distant lights + potholes need higher res)
+pothole_conf:        0.40  # Stricter threshold for potholes only (traffic lights use detector_conf)
 nms_iou:             0.45  # NMS IoU threshold (used by YOLO internally)
 
 # Traffic light lane-relevance thresholds

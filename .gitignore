@@ -6,12 +6,12 @@ data/
 *.7z
 
 # ─── Trained model weights ───────────────────────────────────────────────────
-models/
-*.pt
-*.pth
-*.onnx
-*.h5
-*.tflite
+# models/
+# *.pt
+# *.pth
+# *.onnx
+# *.h5
+# *.tflite
 
 # ─── YOLO training runs ──────────────────────────────────────────────────────
 runs/
