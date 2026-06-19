@@ -8,6 +8,9 @@ Color detection: spatial thirds (position vote) + HSV thresholding (color vote)
 Lane relevance:  x-position ratio + size ratio + aspect ratio heuristics
 """
 
+import json
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -180,6 +183,14 @@ class TrafficLightAnalyzer:
             d["instructions"] = _INSTRUCTIONS.get(color, _INSTRUCTIONS["Unknown"])[d["lane_relevant"]]
         return vp
 
+    def mark_all_lane_relevant(self, lights: list) -> None:
+        """For still-image analysis, skip lane filtering and keep every light."""
+        for d in lights:
+            color = d.get("color", "Unknown")
+            d["lane_relevant"] = True
+            d["lane_score"] = 1.0
+            d["instructions"] = _INSTRUCTIONS.get(color, _INSTRUCTIONS["Unknown"])[True]
+
     # ── False-positive rejection ──────────────────────────
     def _plausible_light(self, d: dict, frame_shape: tuple) -> bool:
         """A real active traffic light is mounted HIGH, is TALLER than wide, and
@@ -235,8 +246,16 @@ TRAP_BOT_HALF  = 0.46          # ... at the bottom
 LANE_SLOPE_MIN = 0.35          # reject near-horizontal clutter (roofs, wires, cross-streets)
 LANE_SLOPE_MAX = 2.5           # reject near-vertical edges (poles, building corners)
 VP_X_BAND      = (0.32, 0.68)  # a valid vanishing point sits near frame centre ...
-VP_Y_BAND      = (0.42, 0.66)  # ... and near the horizon band
+VP_Y_BAND      = (0.44, 0.66)  # ... and near the horizon band
 LANE_W_BAND    = (0.18, 0.95)  # plausible lane width at the bottom (frac W)
+
+_LANE_MAX_AGE  = 5             # reuse last valid lane for at most this many frames
+_lane_cache    = {"lane": None, "vp_x": None, "vp_y": None, "age": 999}
+
+
+def reset_lane_history():
+    """Clear lane smoothing state between independent images/videos."""
+    _lane_cache.update(lane=None, vp_x=None, vp_y=None, age=999)
 
 
 def _fit_line(pts):
@@ -252,10 +271,7 @@ def _fit_line(pts):
     return float(m), float(b)
 
 
-def _lane_mask(frame):
-    """White+yellow markings OR road-boundary edges, kept ONLY inside a road-ahead
-    trapezoid. The trapezoid is what excludes buildings/sidewalks at the frame
-    sides — the main source of false 'lane' edges."""
+def _lane_debug_masks(frame):
     h, w = frame.shape[:2]
     top_y, bot_y = int(h * LANE_HORIZON), int(h * LANE_HOOD)
     cx = w / 2.0
@@ -263,44 +279,208 @@ def _lane_mask(frame):
         (int(cx - TRAP_TOP_HALF * w), top_y), (int(cx + TRAP_TOP_HALF * w), top_y),
         (int(cx + TRAP_BOT_HALF * w), bot_y), (int(cx - TRAP_BOT_HALF * w), bot_y),
     ]], dtype=np.int32)
-    roi = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(roi, trap, 255)
+    roi_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(roi_mask, trap, 255)
 
     hls    = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-    white  = cv2.inRange(hls, np.array([0, 165, 0]),  np.array([255, 255, 70]))
-    yellow = cv2.inRange(hls, np.array([15, 60, 60]), np.array([40, 255, 255]))
-    edges  = cv2.Canny(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 60, 150)
+    white  = cv2.inRange(hls, np.array([0, 170, 0]),  np.array([255, 255, 80]))
+    yellow = cv2.inRange(hls, np.array([15, 75, 80]), np.array([36, 255, 255]))
+    white  = _filter_lane_color_mask(cv2.bitwise_and(white, roi_mask), w, h)
+    yellow = _filter_lane_color_mask(cv2.bitwise_and(yellow, roi_mask), w, h)
+
+    # Blur before Canny to suppress road-texture noise and gravel speckle.
+    gray   = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    edges  = cv2.Canny(gray, 50, 130)
 
     mask = cv2.bitwise_or(cv2.bitwise_or(white, yellow), edges)
-    return cv2.bitwise_and(mask, roi)
+    return {
+        "roi_mask": roi_mask,
+        "roi": cv2.bitwise_and(frame, frame, mask=roi_mask),
+        "white": white,
+        "yellow": yellow,
+        "edges": cv2.bitwise_and(edges, roi_mask),
+        "mask": cv2.bitwise_and(mask, roi_mask),
+    }
 
 
-def _ego_curve(cands, side, centre, w, h):
-    """Fit the ego-lane edge nearest the vehicle as a polynomial x = f(y).
-    Picks the edge closest to the camera centre (the ego boundary), then fits a
-    QUADRATIC when the points span enough of the road (→ traces curves), else a
-    straight line. Returns an np.poly1d (x as a function of y) or None."""
-    tol = 0.06 * w
-    if side == "left":
-        pool = [c for c in cands if c[0] < centre + tol]
-        ref  = max((c[0] for c in pool), default=None)
-    else:
-        pool = [c for c in cands if c[0] > centre - tol]
-        ref  = min((c[0] for c in pool), default=None)
-    if ref is None:
-        return None
-    pts = []
-    for xb, p1, p2 in pool:
-        if abs(xb - ref) <= 0.12 * w:        # wide band so a curve's points are kept
-            pts += [p1, p2]
+def _lane_mask(frame):
+    """White+yellow markings OR road-boundary edges, kept ONLY inside a road-ahead
+    trapezoid. The trapezoid is what excludes buildings/sidewalks at the frame
+    sides — the main source of false 'lane' edges."""
+    return _lane_debug_masks(frame)["mask"]
+
+
+def _filter_lane_color_mask(mask, w, h):
+    """Keep thin lane-marking-like color components, drop grass/sign blobs."""
+    num, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    clean = np.zeros_like(mask)
+    frame_area = max(w * h, 1)
+    max_area = 0.012 * frame_area
+    min_area = max(12, int(0.000015 * frame_area))
+
+    for i in range(1, num):
+        x, y, bw, bh, area = stats[i]
+        if area < min_area:
+            continue
+        if area > max_area:
+            continue
+        fill = area / max(bw * bh, 1)
+        longish = max(bw, bh) / max(min(bw, bh), 1)
+
+        # Lane paint is thin or broken. Large filled regions inside the ROI are
+        # usually grass, signs, or sunlit pavement patches.
+        if area > 0.0025 * frame_area and fill > 0.45 and longish < 8.0:
+            continue
+        if bw > 0.55 * w and bh > 0.08 * h:
+            continue
+        clean[labels == i] = 255
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    return cv2.morphologyEx(clean, cv2.MORPH_OPEN, kernel)
+
+
+def _fit_curve_points(pts, ref, w, h):
+    """Fit x=f(y) from grouped Hough endpoints.
+
+    Start with a robust straight edge and only keep a quadratic when it is
+    genuinely better. This keeps straight roads as clean VP triangles while
+    still allowing real bends to curve toward the same apex.
+    """
     if len(pts) < 4:
         return None
     ys = np.array([p[1] for p in pts], dtype=float)
     xs = np.array([p[0] for p in pts], dtype=float)
     if ys.max() - ys.min() < 0.06 * h:       # too little vertical spread → unstable
         return None
-    deg = 2 if (len(pts) >= 8 and ys.max() - ys.min() > 0.14 * h) else 1
-    return np.poly1d(np.polyfit(ys, xs, deg))
+
+    initial = np.poly1d(np.polyfit(ys, xs, 1))
+    residuals = np.abs(xs - initial(ys))
+    med = float(np.median(residuals))
+    mad = float(np.median(np.abs(residuals - med)))
+    inlier_limit = max(18.0, min(55.0, med + 3.0 * mad + 6.0))
+    keep = residuals <= inlier_limit
+    if int(np.count_nonzero(keep)) >= 4:
+        ys, xs = ys[keep], xs[keep]
+
+    linear = np.poly1d(np.polyfit(ys, xs, 1))
+    linear_err = float(np.mean(np.abs(xs - linear(ys))))
+    if len(xs) < 8 or ys.max() - ys.min() <= 0.16 * h:
+        return linear
+
+    curved = np.poly1d(np.polyfit(ys, xs, 2))
+    curved_base = float(curved(h - 1))
+    curved_err = float(np.mean(np.abs(xs - curved(ys))))
+    curve_swing = float(abs(curved(h - 1) - curved(h * LANE_HORIZON)))
+
+    # Quadratic fits can swing wildly when Hough segments cover only the far/mid
+    # lane. Keep the curve only if it still lands near the selected bottom edge.
+    if (
+        abs(curved_base - ref) <= 0.16 * w
+        and curved_err <= linear_err * 0.78
+        and curve_swing <= 0.75 * w
+    ):
+        return curved
+    return linear
+
+
+def _candidate_refs(cands, side, centre, w):
+    """Return bottom-x bands worth trying for one side of the ego lane."""
+    if not cands:
+        return []
+    tol = 0.12 * w
+    dead = 0.06 * w
+    if side == "left":
+        pool = [c for c in cands if c[0] < centre + tol]
+        anchors = [c for c in pool if c[0] < centre - dead]
+    else:
+        pool = [c for c in cands if c[0] > centre - tol]
+        anchors = [c for c in pool if c[0] > centre + dead]
+    pool = anchors or pool
+    if not pool:
+        return []
+
+    # Cluster by extrapolated bottom x. Dashed/full markings produce several
+    # short Hough segments in the same band; road arrows and centre markings
+    # usually land in their own band and can be rejected later by geometry.
+    refs = []
+    for xb, _p1, _p2 in sorted(pool, key=lambda c: c[0]):
+        if not refs or abs(xb - refs[-1][-1]) > 0.07 * w:
+            refs.append([xb])
+        else:
+            refs[-1].append(xb)
+
+    ranked = []
+    for group in refs:
+        center = float(np.median(group))
+        support = len(group)
+        if side == "left":
+            proximity = 1.0 - min(abs(center - (centre - 0.22 * w)) / (0.45 * w), 1.0)
+        else:
+            proximity = 1.0 - min(abs(center - (centre + 0.22 * w)) / (0.45 * w), 1.0)
+        ranked.append((support + proximity, center))
+    ranked.sort(reverse=True)
+    return [center for _score, center in ranked[:4]]
+
+
+def _edge_from_ref(cands, ref, w, h):
+    """Build one edge curve from the Hough band around ref bottom-x."""
+    band = 0.11 * w
+    pts = []
+    for xb, p1, p2 in cands:
+        if abs(xb - ref) <= band:
+            pts += [p1, p2]
+    return _fit_curve_points(pts, ref, w, h)
+
+
+def _lane_score(lane, vp_x, vp_y, L, R, h, w):
+    """Higher is better for a valid candidate lane pair."""
+    base_y = h - 1
+    horizon = h * LANE_HORIZON
+    lx_b, rx_b = float(L(base_y)), float(R(base_y))
+    lx_t, rx_t = float(L(horizon)), float(R(horizon))
+    bottom_w = max(rx_b - lx_b, 1.0)
+    top_w = max(rx_t - lx_t, 1.0)
+
+    center_at_base = (lx_b + rx_b) / 2.0
+    width_score = 1.0 - min(abs((bottom_w / w) - 0.55) / 0.45, 1.0)
+    center_score = 1.0 - min(abs(center_at_base - w / 2.0) / (w / 2.0), 1.0)
+    vp_score = 1.0 - min(abs(vp_x - w / 2.0) / (w / 2.0), 1.0)
+    converge_score = 1.0 - min(top_w / bottom_w, 1.0)
+    height_score = 1.0 - min(abs(vp_y - horizon) / (0.35 * h), 1.0)
+    left_pos_score = 1.0 - min(abs((lx_b / w) - 0.34) / 0.28, 1.0)
+    right_pos_score = 1.0 - min(abs((rx_b / w) - 0.84) / 0.28, 1.0)
+    return (
+        0.22 * center_score
+        + 0.20 * vp_score
+        + 0.18 * width_score
+        + 0.14 * converge_score
+        + 0.08 * height_score
+        + 0.09 * left_pos_score
+        + 0.09 * right_pos_score
+    )
+
+
+def _select_lane_pair(left, right, centre, w, h):
+    """Try Hough bottom-x bands and return the best valid left/right pair."""
+    best = None
+    for l_ref in _candidate_refs(left, "left", centre, w):
+        L = _edge_from_ref(left, l_ref, w, h)
+        if L is None:
+            continue
+        for r_ref in _candidate_refs(right, "right", centre, w):
+            R = _edge_from_ref(right, r_ref, w, h)
+            if R is None:
+                continue
+            lane, vp_x, vp_y, reason = _validated_lane(L, R, h, w)
+            if lane is None:
+                continue
+            score = _lane_score(lane, vp_x, vp_y, L, R, h, w)
+            if best is None or score > best[0]:
+                best = (score, lane, vp_x, vp_y, reason)
+    if best is None:
+        return None, centre, h * LANE_HORIZON, "no_valid_lane_pair"
+    _score, lane, vp_x, vp_y, reason = best
+    return lane, vp_x, vp_y, reason
 
 
 def _validated_lane(L, R, h, w):
@@ -311,18 +491,29 @@ def _validated_lane(L, R, h, w):
     lane. lane_lines carries a straight chord ('left'/'right') for geometry plus a
     polyline ('left_poly'/'right_poly') for drawing the actual curve."""
     horizon = h * LANE_HORIZON
-    if L is None or R is None:
-        return None, w / 2.0, horizon
+    if L is None and R is None:
+        return None, w / 2.0, horizon, "missing_left_and_right_curve"
+    if L is None:
+        return None, w / 2.0, horizon, "missing_left_curve"
+    if R is None:
+        return None, w / 2.0, horizon, "missing_right_curve"
 
     base_y = h - 1
     lx_b, rx_b = float(L(base_y)), float(R(base_y))      # bottom of frame
     lx_t, rx_t = float(L(horizon)), float(R(horizon))    # at the horizon
 
-    if not (lx_b < w / 2.0 < rx_b):                                   return None, w / 2.0, horizon
+    # Lines must converge correctly — if they cross at or before the horizon the
+    # fit is inverted (centre marking mistaken for a lane edge).
+    if lx_t > rx_t + 0.05 * w:
+        return None, w / 2.0, horizon, "lanes_cross_at_horizon"
+
+    if not (lx_b < w / 2.0 < rx_b):
+        return None, w / 2.0, horizon, "lane_does_not_straddle_center"
     bottom_w = rx_b - lx_b
-    if not (LANE_W_BAND[0] * w <= bottom_w <= LANE_W_BAND[1] * w):    return None, w / 2.0, horizon
+    if not (LANE_W_BAND[0] * w <= bottom_w <= LANE_W_BAND[1] * w):
+        return None, w / 2.0, horizon, "bottom_lane_width_out_of_range"
     if (rx_t - lx_t) > bottom_w * 1.15:    # lane must narrow with distance, not diverge
-        return None, w / 2.0, horizon
+        return None, w / 2.0, horizon, "lane_diverges_toward_horizon"
 
     # Vanishing point = where the two edge chords actually meet (so the drawn edges
     # CONVERGE to a single point, instead of ending apart at the horizon line).
@@ -334,15 +525,18 @@ def _validated_lane(L, R, h, w):
         vp_y = base_y + (rx_b - lx_b) / (m_l - m_r)
     vp_y = max(0.30 * h, min(vp_y, horizon))
     vp_x = lx_b + m_l * (vp_y - base_y)
-    if not (VP_X_BAND[0] * w <= vp_x <= VP_X_BAND[1] * w):            return None, vp_x, vp_y
+    if not (VP_X_BAND[0] * w <= vp_x <= VP_X_BAND[1] * w):
+        return None, vp_x, vp_y, "vanishing_point_x_out_of_band"
+    if not (VP_Y_BAND[0] * h <= vp_y <= VP_Y_BAND[1] * h):
+        return None, vp_x, vp_y, "vanishing_point_y_out_of_band"
 
     # Curved edges (near field) that CONVERGE to the vanishing point (far field).
     apex = (int(round(vp_x)), int(round(vp_y)))
-    ys = np.linspace(base_y, horizon, 14)
+    ys = np.linspace(base_y, vp_y, 14, endpoint=False)
     left_poly  = [(int(L(y)), int(y)) for y in ys] + [apex]
     right_poly = [(int(R(y)), int(y)) for y in ys] + [apex]
     if any(not (-0.15 * w <= x <= 1.15 * w) for x, _ in left_poly + right_poly):
-        return None, vp_x, vp_y
+        return None, vp_x, vp_y, "lane_curve_out_of_frame"
 
     lane = {
         "left":  [int(lx_b), base_y, apex[0], apex[1]],   # straight chord → VP (geometry)
@@ -350,7 +544,7 @@ def _validated_lane(L, R, h, w):
         "left_poly":  left_poly,                          # curve → VP (drawing)
         "right_poly": right_poly,
     }
-    return lane, float(vp_x), float(vp_y)
+    return lane, float(vp_x), float(vp_y), "valid_lane"
 
 
 def default_roi_lane(frame_shape):
@@ -366,24 +560,28 @@ def default_roi_lane(frame_shape):
     }
 
 
-def detect_lane(frame: np.ndarray, default_ratio: float = 0.5):
+def detect_lane(frame: np.ndarray, default_ratio: float = 0.5, explain: bool = False):
     """Robust ego-lane detection (pure CV).
 
     Masks white/yellow markings + road-boundary edges inside a road-ahead
     trapezoid, fits the nearest left & right edges, and VALIDATES the geometry.
-    Returns (vp_x, vp_y, lane_lines, segments). lane_lines is None whenever the
-    result isn't a confident, sane lane — the caller then draws a clean forward
-    corridor instead of garbage.
+    Returns (vp_x, vp_y, lane_lines, segments). With explain=True, appends a
+    validation reason. lane_lines is None whenever the result isn't a confident,
+    sane lane — the caller then draws a clean forward corridor instead of garbage.
     """
     h, w = frame.shape[:2]
     cx, horizon = w * default_ratio, h * LANE_HORIZON
     if h < 40 or w < 40:
+        if explain:
+            return cx, horizon, None, [], "frame_too_small"
         return cx, horizon, None, []
 
     mask  = _lane_mask(frame)
-    lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=40,
-                            minLineLength=max(int(h * 0.10), 25), maxLineGap=60)
+    lines = cv2.HoughLinesP(mask, 1, np.pi / 180, threshold=25,
+                            minLineLength=max(int(h * 0.06), 45), maxLineGap=80)
     if lines is None:
+        if explain:
+            return cx, horizon, None, [], "no_hough_lines"
         return cx, horizon, None, []
 
     base_y = h - 1
@@ -404,12 +602,105 @@ def detect_lane(frame: np.ndarray, default_ratio: float = 0.5):
         elif slope > 0 and mid_x > centre - 0.10 * w:
             right.append((x_bottom, (x1, y1), (x2, y2)))
 
-    L = _ego_curve(left,  "left",  centre, w, h)
-    R = _ego_curve(right, "right", centre, w, h)
-    lane, vp_x, vp_y = _validated_lane(L, R, h, w)
+    lane, vp_x, vp_y = None, cx, horizon
+    reason = "no_segments_after_slope_filter"
+    if segs:
+        lane, vp_x, vp_y, reason = _select_lane_pair(left, right, centre, w, h)
+
+    if lane is not None:
+        _lane_cache.update(lane=lane, vp_x=vp_x, vp_y=vp_y, age=0)
+        if explain:
+            return vp_x, vp_y, lane, segs, reason
+        return vp_x, vp_y, lane, segs
+
+    # Detection failed — reuse last valid lane for a few frames so that
+    # junctions / arrows / sparse marking frames don't drop to fallback.
+    _lane_cache["age"] += 1
+    if _lane_cache["lane"] is not None and _lane_cache["age"] <= _LANE_MAX_AGE:
+        if explain:
+            return (_lane_cache["vp_x"], _lane_cache["vp_y"],
+                    _lane_cache["lane"], segs, "smoothed_from_history")
+        return _lane_cache["vp_x"], _lane_cache["vp_y"], _lane_cache["lane"], segs
+
+    if explain:
+        return cx, horizon, None, segs, reason
+    return cx, horizon, None, segs
+
+
+def _draw_debug_lane(frame, lane, assumed=False):
+    color = (0, 200, 220) if assumed else (0, 220, 0)
+    thickness = 2 if assumed else 3
+    for key in ("left", "right"):
+        poly = lane.get(key + "_poly")
+        if poly and len(poly) >= 2:
+            cv2.polylines(frame, [np.array(poly, dtype=np.int32).reshape(-1, 1, 2)],
+                          False, color, thickness)
+        elif lane.get(key):
+            x1, y1, x2, y2 = lane[key]
+            cv2.line(frame, (x1, y1), (x2, y2), color, thickness)
+
+
+def save_lane_debug(frame: np.ndarray, output_dir, prefix: str = "frame") -> dict:
+    """Save lane detector debug images and return the matching JSON report."""
+    frame_dir = Path(output_dir) / prefix
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    debug = _lane_debug_masks(frame)
+    vp_x, vp_y, lane, segments, validation_reason = detect_lane(frame, explain=True)
+    lane_found = lane is not None
     if lane is None:
-        return cx, horizon, None, segs          # not confident → caller uses fallback
-    return vp_x, vp_y, lane, segs
+        _vp, lane = default_roi_lane(frame.shape)
+
+    segments_img = frame.copy()
+    for x1, y1, x2, y2 in segments:
+        cv2.line(segments_img, (x1, y1), (x2, y2), (255, 0, 255), 2)
+
+    final_img = frame.copy()
+    _draw_debug_lane(final_img, lane, assumed=not lane_found)
+    label = "detected" if lane_found else "fallback"
+    color = (0, 220, 0) if lane_found else (0, 200, 220)
+    cv2.putText(final_img, f"lane: {label}", (20, 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+    cv2.putText(final_img, f"vp: ({vp_x:.1f}, {vp_y:.1f})", (20, 76),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+    cv2.imwrite(str(frame_dir / "original.jpg"), frame)
+    cv2.imwrite(str(frame_dir / "roi.jpg"), debug["roi"])
+    cv2.imwrite(str(frame_dir / "white.jpg"), debug["white"])
+    cv2.imwrite(str(frame_dir / "yellow.jpg"), debug["yellow"])
+    cv2.imwrite(str(frame_dir / "edges.jpg"), debug["edges"])
+    cv2.imwrite(str(frame_dir / "mask.jpg"), debug["mask"])
+    cv2.imwrite(str(frame_dir / "segments.jpg"), segments_img)
+    cv2.imwrite(str(frame_dir / "final.jpg"), final_img)
+
+    centre = frame.shape[1] / 2.0
+    left_candidates = 0
+    right_candidates = 0
+    for x1, y1, x2, y2 in segments:
+        if x2 == x1:
+            continue
+        slope = (y2 - y1) / (x2 - x1)
+        mid_x = (x1 + x2) / 2.0
+        if slope < 0 and mid_x < centre + 0.10 * frame.shape[1]:
+            left_candidates += 1
+        elif slope > 0 and mid_x > centre - 0.10 * frame.shape[1]:
+            right_candidates += 1
+
+    report = {
+        "lane_found": lane_found,
+        "validation_reason": validation_reason,
+        "vanishing_point": {"x": round(float(vp_x), 2), "y": round(float(vp_y), 2)},
+        "white_pixels": int(np.count_nonzero(debug["white"])),
+        "yellow_pixels": int(np.count_nonzero(debug["yellow"])),
+        "edge_pixels": int(np.count_nonzero(debug["edges"])),
+        "mask_pixels": int(np.count_nonzero(debug["mask"])),
+        "segments": len(segments),
+        "left_candidates": left_candidates,
+        "right_candidates": right_candidates,
+    }
+    with open(frame_dir / "report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    return report
 
 
 def _estimate_vanishing_x(frame: np.ndarray, default_ratio: float = 0.5) -> float:

@@ -27,7 +27,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from analyzers.pothole_analyzer import PotholeAnalyzer
-from analyzers.traffic_analyzer import TrafficLightAnalyzer, detect_lane, default_roi_lane
+from analyzers.traffic_analyzer import (
+    TrafficLightAnalyzer,
+    default_roi_lane,
+    detect_lane,
+    reset_lane_history,
+)
 
 # How long (seconds) to reuse the last detected lane on video when a frame has none
 LANE_MEMORY_TTL = 1.0
@@ -278,7 +283,7 @@ class Pipeline:
 
     def run(self, frame: np.ndarray, detector: str = "default",
             track: bool = False, reset_track: bool = False,
-            imgsz: int = None) -> dict:
+            imgsz: int = None, use_lane: bool = None) -> dict:
         """
         Process one BGR frame.
 
@@ -286,6 +291,8 @@ class Pipeline:
         track       : use ByteTrack to associate detections across frames (video).
                       Smooths flicker and recovers objects that briefly dip below conf.
         reset_track : start a fresh tracker (pass True on the first frame of a video).
+        use_lane    : apply lane detection/relevance filtering. Defaults to True for
+                      video/dashcam requests and False for still-image requests.
 
         Returns dict:
             annotated_frame, warnings, potholes, traffic_lights
@@ -300,9 +307,19 @@ class Pipeline:
                 "lane":            None,
             }
 
-        # Fresh tracker state at the start of each video
-        if track and reset_track:
-            self._tl_hits = {}
+        if use_lane is None:
+            use_lane = track or detector == "dashcam"
+
+        # Fresh tracker/lane state at the start of each video. Still images skip
+        # lane processing, so stale lane history should never affect them.
+        if use_lane:
+            if track and reset_track:
+                self._tl_hits = {}
+                reset_lane_history()
+            elif not track:
+                reset_lane_history()
+        else:
+            reset_lane_history()
 
         # Stage 1 — detect (optionally with temporal tracking on video)
         eff_imgsz = imgsz if imgsz else self.detector_imgsz
@@ -347,13 +364,15 @@ class Pipeline:
                     traffic_lights.append({"box": coords, "conf": conf,
                                            "track_id": tid, **analysis})
 
-        # Resolve the road: detected lane lines → last-known (video) → fixed ROI.
-        vp_x, lane_lines, lane_assumed = self._resolve_lane(frame, detector)
-        lane = {**lane_lines, "confident": True, "assumed": lane_assumed}
+        lane = None
+        if use_lane:
+            # Resolve the road: detected lane lines → last-known (video) → fixed ROI.
+            vp_x, lane_lines, lane_assumed = self._resolve_lane(frame, detector)
+            lane = {**lane_lines, "confident": True, "assumed": lane_assumed}
 
-        # Reject false positives, then keep ONLY the single light governing the
-        # driver's lane (nearest + most aligned with the road ahead).
-        if traffic_lights:
+        if traffic_lights and use_lane:
+            # Reject false positives, then keep ONLY the single light governing the
+            # driver's lane (nearest + most aligned with the road ahead).
             self.traffic_analyzer.select_lane_relevant(traffic_lights, frame, vp=vp_x)
             traffic_lights = [t for t in traffic_lights if t["lane_relevant"]]
 
@@ -368,10 +387,15 @@ class Pipeline:
                     if (self._tl_hits[tid] < TL_CONFIRM_FRAMES
                             and t["conf"] < TL_CONFIRM_CONF):
                         traffic_lights = []
+        elif traffic_lights:
+            # Still-image mode: do not run lane detection or hide detections based
+            # on lane geometry. The uploaded photo is a general detection result.
+            self.traffic_analyzer.mark_all_lane_relevant(traffic_lights)
 
         # Keep only potholes inside the detected lane corridor (between the green
         # lines). Skipped when the lane is just the assumed ROI (no real lines).
-        if potholes and not lane["assumed"] and lane.get("left") and lane.get("right"):
+        if (use_lane and potholes and lane and not lane["assumed"]
+                and lane.get("left") and lane.get("right")):
             potholes = [d for d in potholes if pothole_in_lane(d["box"], lane)]
 
         annotated = draw_detections(frame, potholes, traffic_lights)
