@@ -1,0 +1,168 @@
+================================================================================
+  SMART ROAD ASSISTANT — DATA ACQUISITION DETAILS
+  Computer Vision Project | Group 35
+================================================================================
+
+
+--------------------------------------------------------------------------------
+SOURCE 1 — PUBLIC POTHOLE DATASETS (Downloaded)
+--------------------------------------------------------------------------------
+
+1. Chitholian Annotated Pothole Dataset
+   - Platform  : Kaggle (chitholian/annotated-potholes-dataset)
+   - Format    : Pascal VOC XML — one .xml file per image with <bndbox> coords
+   - Size      : ~665 JPG images + matching annotation files
+   - Classes   : pothole
+   - Used for  : Stage 1 Detector (class 0 = pothole)
+                 Stage 2a Severity — pothole crops (Low / Medium / High)
+
+2. Kaggle Pothole Dataset
+   - Platform  : Kaggle (sachinkumar413/pothole-images-dataset)
+   - Format    : Pascal VOC XML (annotations/ folder + images/ folder)
+   - Classes   : pothole
+   - Used for  : Stage 1 Detector (class 0 = pothole)
+                 Stage 2a Severity — pothole crops
+
+
+--------------------------------------------------------------------------------
+SOURCE 2 — PUBLIC TRAFFIC LIGHT DATASETS (Downloaded)
+--------------------------------------------------------------------------------
+
+3. LISA Traffic Light Dataset
+   - Platform  : Kaggle (mbornoe/lisa-traffic-light-dataset)
+   - Format    : CSV — frameAnnotationsBOX.csv per sequence, semicolon-delimited
+   - Fields    : Filename, Annotation tag (go/stop/warning),
+                 Upper left corner X/Y, Lower right corner X/Y
+   - Size      : 43,000+ annotated frames
+   - Sequences : dayTrain, nightTrain, daySequence1, daySequence2,
+                 nightSequence1, nightSequence2
+   - Used for  : Stage 1 Detector (class 1 = traffic_light)
+
+4. Bosch Small Traffic Lights Dataset
+   - Platform  : Kaggle (isaienkov/bosch-small-traffic-lights-dataset)
+   - Format    : YAML — train.yaml and test.yaml with pixel bounding boxes
+   - Fields    : path, boxes { x_min, y_min, x_max, y_max, label }
+   - Labels    : go/green, stop/red, warning/yellow → all unified as traffic_light
+   - Used for  : Stage 1 Detector (class 1 = traffic_light)
+
+
+--------------------------------------------------------------------------------
+SOURCE 3 — OUR OWN DASHCAM DATA (Manual Annotation by the Team)
+--------------------------------------------------------------------------------
+
+WHY THIS WAS NEEDED:
+   The detector trained purely on public datasets had a domain gap.
+   It only detected potholes in 2 out of 659 real dashcam frames (conf >= 0.40).
+   Public datasets are mostly close-up photos; a dashcam sees potholes small,
+   distant, and at a shallow angle — a completely different visual appearance.
+
+WHAT WE DID:
+
+   Step 1 — Frame Extraction
+   - Tool     : src/extract_frames.py (custom script)
+   - Input    : Real dashcam video files (.mp4)
+   - Output   : data/raw/dashcam_frames/ — diverse, sharp, unique frames
+   - Settings : One frame every 1.5 seconds, max 500 frames per video
+   - Filters  : Perceptual hashing to remove near-duplicate frames
+                Laplacian variance check to discard blurry frames
+
+   Step 2 — Manual Annotation
+   - Tool     : makesense.ai (free online annotation tool, no install needed)
+   - Process  : Uploaded extracted frames to makesense.ai
+                Drew rectangular bounding boxes around potholes
+                Labelled all boxes as class "pothole"
+   - Output   : YOLO-format .txt label files (normalised coordinates)
+
+   Step 3 — Annotation Correction
+   - Tool     : makesense.ai (review mode)
+   - Process  : Reviewed each annotated frame
+                Corrected box positions where needed
+                Deleted false positive boxes
+   - Export   : YOLOv8 format — one .txt file per image
+
+   Step 4 — Fine-tuning
+   - Notebook : 06-dashcam-detector.ipynb
+   - Combined : Corrected dashcam annotations + external YOLO pothole datasets
+   - Result   : models/detector_dashcam.pt — dashcam-specific detector
+   - Used for : Dashboard (video) page of the web application
+
+
+--------------------------------------------------------------------------------
+DATA PROCESSING PIPELINE
+--------------------------------------------------------------------------------
+
+RAW DATA                     PROCESSING STEP                  OUTPUT
+─────────────────────────────────────────────────────────────────────────────
+Chitholian XML   ─┐
+Kaggle XML       ─┼─ Format conversion (VOC/CSV/YAML → YOLO) ─► detector_yolo/
+LISA CSV         ─┤  Class unification (pothole=0, traffic=1)   images/ + labels/
+Bosch YAML       ─┘  Random split: 70% train / 20% val / 10%    train / val / test
+                     test  |  Random seed = 42
+
+Dashcam videos   ─► extract_frames.py (frame sampling)
+                 ─► makesense.ai (manual bounding box drawing) ─► detector_dashcam.pt
+                 ─► Export YOLO format (.txt labels)              fine-tuned model
+
+All pothole data ─► Crop each bounding box (+ 10px padding)   ─► severity_crops/
+                 ─► Auto-label by area ratio:                     Low / Medium / High
+                      box/image < 3%   → Low                      train / val / test
+                      3% to 12%        → Medium
+                      >= 12%           → High
+
+detector_yolo/   ─► GPU weather augmentation (augment.py)     ─► detector_yolo_aug/
+train split only    Rain  : 700 rain streaks via motion blur      3x more images
+                    Fog   : Gaussian blur + brightness overlay     ~79k total
+                    Night : Gamma darkening + contrast reduction   (from ~26k original)
+                    Wet   : Glare simulation on lower half
+
+
+--------------------------------------------------------------------------------
+ANNOTATION SUMMARY — MANUAL vs AUTOMATIC
+--------------------------------------------------------------------------------
+
+Data                              Annotated By          Tool Used
+────────────────────────────────────────────────────────────────────────────────
+Pothole boxes (Chitholian/Kaggle) Original creators     Manual (LabelImg/Roboflow)
+Traffic light boxes (LISA/Bosch)  Original creators     Manual / Semi-automated
+Dashcam frames — pothole boxes    OUR TEAM              makesense.ai
+Severity labels (Low/Med/High)    Automated by code     Area ratio rule in
+                                                        prepare_data.py
+
+
+--------------------------------------------------------------------------------
+FINAL DATASET SIZES (approximate)
+--------------------------------------------------------------------------------
+
+Stage 1 Detector (detector_yolo/)
+   Train : ~18,000 images  (pothole + traffic_light combined)
+   Val   :  ~5,200 images
+   Test  :  ~2,600 images
+   Aug   : ~79,000 images  (train split only, weather-augmented)
+
+Stage 2a Severity Crops (severity_crops/)
+   Train : varies by dataset size  (split 70/20/10 from pothole boxes)
+   Val   : --
+   Test  : --
+   Classes : Low, Medium, High  (auto-labelled by bounding box area)
+
+
+--------------------------------------------------------------------------------
+WHERE EACH DATASET IS USED IN THE SYSTEM
+--------------------------------------------------------------------------------
+
+Dataset                   Stage 1 Detector   Stage 2a Severity   Stage 2b Traffic
+──────────────────────────────────────────────────────────────────────────────────
+Chitholian potholes        Yes (class 0)      Yes (crop source)   No
+Kaggle potholes            Yes (class 0)      Yes (crop source)   No
+LISA traffic lights        Yes (class 1)      No                  Indirectly *
+Bosch traffic lights       Yes (class 1)      No                  Indirectly *
+Dashcam (our annotation)   Yes (dashcam       No                  No
+                           model only)
+
+* Traffic lights are detected by Stage 1, then the crop is passed to the
+  classical CV analyzer (HSV thresholding) — no separate training dataset needed.
+
+
+================================================================================
+  END OF DATA ACQUISITION DETAILS
+================================================================================

@@ -72,7 +72,7 @@ def _load_config() -> dict:
         "tl_min_aspect_ratio": 1.2,
     }
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             loaded = yaml.safe_load(f) or {}
         defaults.update(loaded)
     return defaults

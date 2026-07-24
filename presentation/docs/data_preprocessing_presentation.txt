@@ -1,0 +1,779 @@
+================================================================================
+  SMART ROAD ASSISTANT — DATA PREPROCESSING
+  Framed as Computer Vision & Image Processing Techniques
+  Computer Vision Project | Group 35
+================================================================================
+
+
+================================================================================
+  OVERVIEW — 3 STAGES, ALL GROUNDED IN CV/IP
+================================================================================
+
+  Stage 1  →  Frame Extraction          (Temporal Sampling + Image Quality Analysis)
+  Stage 2  →  Data Preparation          (Geometric Transforms + ROI Extraction)
+  Stage 3  →  Data Augmentation         (Photometric & Spatial Image Processing)
+
+
+================================================================================
+  STAGE 1 — FRAME EXTRACTION FROM DASHCAM VIDEOS
+  File: src/extract_frames.py
+  CV/IP Techniques: Laplacian Edge Operator, DCT-based Perceptual Hashing
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 1 — LAPLACIAN OPERATOR FOR BLUR DETECTION
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  The Laplacian is a second-order derivative operator used in image processing
+  to measure the rate of change of intensity gradients. It is defined as:
+
+      ∇²f = ∂²f/∂x² + ∂²f/∂y²
+
+  A sharp image has strong, high-frequency edges — the Laplacian response
+  at edge pixels is large. A blurry image has softened edges — the Laplacian
+  response is weak everywhere. The variance of the Laplacian across all pixels
+  summarises this sharpness into a single scalar.
+
+How we used it:
+  We compute the Laplacian of each greyscale frame and take its pixel variance:
+      cv2.Laplacian(gray, cv2.CV_64F).var()
+  Frames below a threshold of 60.0 are rejected as too blurry to annotate.
+
+Why it matters for CV:
+  Motion blur during dashcam recording causes pothole bounding box boundaries
+  to be undefined — the pothole edge literally does not exist as a detectable
+  feature in the image. Training the detector on such frames injects label
+  noise: the model is shown a box around a region that has no clear boundary,
+  which degrades detection precision.
+
+Result:
+  Blurry frames (common during road bumps and sharp turns) are automatically
+  rejected before annotation, giving a cleaner training dataset.
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 2 — PERCEPTUAL HASHING (DCT-BASED IMAGE SIMILARITY)
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  Perceptual hashing (pHash) is a compact image descriptor based on the
+  Discrete Cosine Transform (DCT) — the same transform used in JPEG compression.
+  It represents the dominant low-frequency visual structure of an image as a
+  64-bit binary fingerprint.
+
+How it works:
+  1. Resize the frame to 32×32 pixels (removes fine detail, keeps structure)
+  2. Apply 2D DCT — transforms pixel space to frequency space
+  3. Keep only the top-left 8×8 DCT coefficients (lowest frequencies)
+  4. Binarize: bit = 1 if coefficient > median, else 0
+  → Result: a 64-bit hash fingerprint
+
+  Two images are "visually similar" if their Hamming distance (number of
+  differing bits) is ≤ 6 out of 64.
+
+      small = cv2.resize(gray, (32, 32))
+      dct   = cv2.dct(small)[:8, :8]
+      hash  = dct > np.median(dct)         ← 64-bit binary descriptor
+
+How we used it:
+  Each kept frame's hash is compared against the last 30 kept frames.
+  If Hamming distance ≤ 6, the frame is a near-duplicate and is discarded.
+
+Why it matters for CV:
+  At 30 FPS, consecutive frames are nearly identical. Including duplicates
+  introduces data redundancy bias — the model sees the same visual pattern
+  hundreds of times, causing it to overfit to that specific scene while
+  underperforming on diverse real-world footage.
+
+Result:
+  A dashcam trip that produces 108,000 raw frames is reduced to ~2,400
+  visually diverse, sharp frames ready for annotation.
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ SLIDE SUGGESTIONS — STAGE 1                                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Figure A: Blur Detection                                                    │
+│   - Show 2 side-by-side frames: one sharp (high Laplacian var), one blurry  │
+│   - Show the Laplacian edge map of each (cv2.Laplacian visualised as image) │
+│   - Add the score: "Variance = 312 → Kept" vs "Variance = 18 → Rejected"   │
+│                                                                             │
+│ Figure B: pHash Deduplication                                               │
+│   - Show 3 consecutive frames that look nearly identical                    │
+│   - Show the 8×8 DCT coefficient grid for each                              │
+│   - Show binarized hash + Hamming distance = 2 → "Duplicate, Rejected"     │
+│                                                                             │
+│ Figure C: Before vs After Pipeline                                          │
+│   - Left: 12 raw frames from 1 second of video (all similar, some blurry)  │
+│   - Right: 2 kept frames after blur filter + dedup                          │
+│                                                                             │
+│ HOW TO PROVE IT WAS DONE:                                                   │
+│   - Run this command and screenshot the output:                             │
+│     python src/extract_frames.py <video> -o data/raw/dashcam_frames        │
+│     It prints: "kept 312 (skipped 88 blurry, 214 duplicate, of 614 sampled)│
+│   - Show data/raw/dashcam_frames/ folder with file count in Windows Explorer│
+│   - Open a kept frame vs a skipped frame in an image viewer                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+  STAGE 2 — DATA PREPARATION: FORMAT CONVERSION & GEOMETRIC TRANSFORMS
+  File: src/prepare_data.py
+  CV/IP Techniques: Coordinate Normalisation, ROI Cropping, Spatial Auto-labelling
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 3 — BOUNDING BOX COORDINATE NORMALISATION (Geometric Transform)
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  In image processing, coordinate normalisation maps pixel-space coordinates
+  to a scale-invariant representation. All four source datasets store
+  bounding boxes in absolute pixel coordinates (xmin, ymin, xmax, ymax).
+  YOLO requires a different representation: centre point + dimensions,
+  normalised to image size.
+
+The transformation (applied to every bounding box):
+      x_center = (xmin + xmax) / (2 × image_width)
+      y_center = (ymin + ymax) / (2 × image_height)
+      width    = (xmax  − xmin) / image_width
+      height   = (ymax  − ymin) / image_height
+
+  All values fall in [0, 1] — completely resolution-independent.
+
+Why it matters for CV:
+  - Images in the dataset range from 480×360 to 1920×1080 pixels
+  - A normalised annotation is valid regardless of the image resolution
+  - During training, YOLOv8 resizes all images to 640×640 — normalised coords
+    scale correctly with no modification to the label file
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 4 — ROI (REGION OF INTEREST) EXTRACTION WITH PADDING
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  Region of Interest (ROI) extraction is a fundamental CV operation: crop a
+  meaningful sub-region from a full image to isolate a specific object for
+  further analysis. Boundary padding ensures the ROI includes context pixels
+  around the object edge.
+
+How we used it:
+  For the Stage 2a severity classifier, each pothole bounding box is extracted
+  from the original image with 10-pixel padding on all sides:
+
+      x1 = max(xmin − 10, 0)          ← clamp to image boundary
+      y1 = max(ymin − 10, 0)
+      x2 = min(xmax + 10, img_width)
+      y2 = min(ymax + 10, img_height)
+      crop = image[y1:y2, x1:x2]
+
+  Each crop is then resized to 128×128 pixels for the classifier input.
+
+Why it matters for CV:
+  The full image contains road, sky, vehicles — irrelevant background for
+  severity assessment. ROI extraction focuses the classifier on the pothole
+  region only, removing background noise. The 10px padding retains the
+  pothole edge and immediate surrounding texture, which carry information
+  about depth and damage extent.
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 5 — SPATIAL AUTO-LABELLING (Area Ratio Heuristic)
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  This uses spatial analysis of the detected region's geometry as a proxy
+  for object severity — a form of image-based measurement. The underlying
+  CV principle is that apparent object size in an image is inversely
+  proportional to distance, and directly proportional to physical size.
+
+Rule applied to every pothole bounding box:
+      ratio = box_area / image_area
+              = (width_px × height_px) / (img_width × img_height)
+
+      ratio < 0.03   → Low    (small/distant pothole)
+      0.03 – 0.12    → Medium
+      ≥ 0.12         → High   (large/close pothole — high danger)
+
+Why it matters for CV:
+  A large bounding box means the pothole occupies more of the frame →
+  it is either physically large or very close to the camera → greater
+  immediate danger. This heuristic derives a semantic label (severity)
+  purely from geometric measurement, without any human annotation effort.
+  It is equivalent to a simple rule-based classifier operating in the
+  spatial domain.
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ SLIDE SUGGESTIONS — STAGE 2                                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Figure D: Annotation Format Comparison                                      │
+│   - Show the same pothole in 3 formats side by side:                        │
+│     VOC XML (xmin/ymin/xmax/ymax) | YOLO .txt | Visual box on image        │
+│   - Highlight the coordinate transformation formula                         │
+│                                                                             │
+│ Figure E: ROI Crop Extraction                                               │
+│   - Show a full road image → highlighted bounding box → extracted 128×128  │
+│     crop (with padding visible)                                             │
+│   - Do this for Low, Medium, High severity examples                         │
+│                                                                             │
+│ Figure F: Severity Auto-Labelling                                           │
+│   - Show 3 potholes at different scales with area ratio annotated:          │
+│     Small box (ratio=0.018 → Low), medium (0.07 → Medium), large (0.15 →  │
+│     High)                                                                   │
+│   - Show the formula as an overlay                                          │
+│                                                                             │
+│ Figure G: Dataset Split Statistics                                          │
+│   - Bar chart: train/val/test image counts per class                        │
+│   - Grouped bar: Low/Medium/High crop counts per split                      │
+│   → These charts are ALREADY IN notebook 07-validation.ipynb Section 1     │
+│                                                                             │
+│ HOW TO PROVE IT WAS DONE:                                                   │
+│   - Run notebook 07-validation.ipynb → Section 1 produces these exact charts│
+│   - Show data/processed/detector_yolo/ folder structure in file explorer    │
+│   - Open any .txt label file and match the numbers to an image visually     │
+│   - Show severity_crops/ folder: Low/ Medium/ High/ with crop images inside │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+  STAGE 3 — DATA AUGMENTATION: PHOTOMETRIC IMAGE PROCESSING
+  File: src/augment.py
+  CV/IP Techniques: Convolution, Alpha Blending, Gamma Correction,
+                    Colour Space Manipulation, GPU Tensor Processing
+================================================================================
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 6 — RAIN SIMULATION USING 1D CONVOLUTION
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  Convolution is the most fundamental operation in image processing.
+  Here, a 1D vertical averaging kernel simulates motion blur — the same
+  principle used in motion blur filters in any image editing tool.
+
+How it works:
+  Step 1: Create a sparse mask of 700 random bright pixels (simulating
+          rain drop positions).
+  Step 2: Apply a vertical 1D convolution kernel of length 10–22 pixels
+          (randomly chosen per image):
+              kernel = [1/L, 1/L, ..., 1/L]  (L entries, vertical direction)
+          This stretches each bright dot into a vertical streak.
+  Step 3: Blend the rain layer onto the image:
+              result = image × 0.88 + rain_streaks × 0.55
+
+  This is equivalent to a motion blur filter applied directionally, then
+  composited using alpha blending.
+
+Why it matters for CV:
+  Rain creates visual occlusion — it reduces object contrast, adds texture
+  noise, and partially obscures the road surface. A model that never trains
+  on rain images will lose confidence on wet-day dashcam footage. The
+  convolution approach is computationally efficient (GPU tensor op) compared
+  to drawing individual lines with a CPU loop.
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 7 — FOG SIMULATION USING ALPHA BLENDING
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  Alpha blending (linear interpolation between two images) is a standard
+  compositing technique in image processing. Fog reduces visibility by
+  scattering light — modelled as blending the scene with a uniform white layer.
+
+Formula:
+      result = image × (1 − α) + white × α
+      where α = uniform(0.35, 0.55)
+
+  This is the standard image compositing over operation with a flat white
+  background. At α = 0.5, the image and fog contribute equally.
+
+Why it matters for CV:
+  Fog globally reduces image contrast and suppresses high-frequency detail
+  (edges, textures). Since pothole detection relies on edge response and
+  texture cues, training on foggy images forces the model to develop
+  more robust, low-frequency features.
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 8 — NIGHT SIMULATION USING GAMMA / POINT OPERATION
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  A point operation (or intensity mapping) transforms each pixel independently:
+      output(x,y) = f(input(x,y))
+  Gamma correction is a specific point operation: output = input^γ.
+  Reducing brightness by multiplication is equivalent to linear gamma < 1.
+
+How we applied it:
+      result = image × brightness   (brightness = uniform(0.18, 0.30))
+      result[blue_channel] += 0.04  ← slight blue cast
+
+  The blue channel addition simulates the colour temperature of LED streetlights
+  (which have a cool blue tint compared to daylight).
+
+Why it matters for CV:
+  Night dashcam footage has fundamentally different contrast distribution
+  from daytime images. Shadows are deeper, highlights (headlights, streetlights)
+  create severe contrast ratios, and road texture is less visible. Training
+  without night images means the model has only learned daylight feature
+  distributions.
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 9 — WET ROAD SIMULATION USING COLOUR SPACE MANIPULATION
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  Saturation adjustment operates in the HSV (Hue-Saturation-Value) colour
+  space. Saturation controls the vividness of colours — a wet road has
+  higher saturation because water on the surface enhances colour reflection.
+  Brightness adjustment operates on the V channel of HSV.
+
+How we applied it:
+      saturation × uniform(1.2, 1.5)    ← increase colour vividness
+      brightness × uniform(0.75, 0.90)  ← slightly reduce overall brightness
+
+  Internally: torchvision converts RGB → HSV, scales S and V channels, and
+  converts back to RGB.
+
+Why it matters for CV:
+  Wet roads have high reflectivity — they can produce specular highlights
+  that visually resemble pothole shadows. Training on wet-road images teaches
+  the model to distinguish genuine potholes from wet-surface reflections,
+  reducing false positives.
+
+──────────────────────────────────────────────────────────────────────────────
+TECHNIQUE 10 — GPU-ACCELERATED TENSOR PROCESSING
+──────────────────────────────────────────────────────────────────────────────
+
+What it is (CV/IP concept):
+  Modern deep learning frameworks (PyTorch) represent images as floating-point
+  tensors on the GPU. All arithmetic operations (convolution, blending, gamma)
+  run as massively parallel GPU operations — the same hardware used for
+  neural network training.
+
+How we used it:
+  Images are converted: BGR uint8 (OpenCV) → float32 RGB tensor (PyTorch):
+      t = torch.from_numpy(rgb).permute(2,0,1).float().div(255.0).to(DEVICE)
+  All weather effects operate on these tensors directly.
+  Output is converted back: tensor → BGR uint8 for disk storage.
+
+Why it matters:
+  Processing 26,000 training images × 3 copies = 78,000 augmented files.
+  GPU tensor ops are 50–100× faster than equivalent CPU pixel loops.
+  Additionally, multiprocessing (CPU cores − 2 workers) parallelises the
+  file I/O, saturating both the GPU and disk simultaneously.
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ SLIDE SUGGESTIONS — STAGE 3                                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Figure H: Augmentation Grid (THE KEY SLIDE)                                 │
+│   - 5 columns × 5 rows grid:                                                │
+│     Row 1: Original images (5 different scenes)                             │
+│     Row 2: Same images with Rain applied                                    │
+│     Row 3: Same images with Fog applied                                     │
+│     Row 4: Same images with Night applied                                   │
+│     Row 5: Same images with Wet Road applied                                │
+│   → Run notebook 01-explore-data.ipynb or write 10 lines to generate this  │
+│                                                                             │
+│ Figure I: Rain Convolution Diagram                                          │
+│   - Show: sparse dots mask → after vertical conv → final composite          │
+│   - Label the 1D kernel shape                                               │
+│   - Compare to standard motion blur (same concept)                          │
+│                                                                             │
+│ Figure J: Dataset Size Before vs After Augmentation                         │
+│   - Simple bar chart:                                                        │
+│     Original train: ~26,000 images                                          │
+│     Augmented train: ~79,000 images  (3× expansion)                         │
+│   - Pie chart: what fraction of augmented set is rain/fog/night/wet         │
+│                                                                             │
+│ Figure K: Colour Histogram Comparison                                       │
+│   - Show RGB histogram of original image vs fog vs night vs rain versions   │
+│   - Night histogram is shifted left (dark), fog is compressed toward white  │
+│   - This visually proves the photometric transformations are working        │
+│                                                                             │
+│ HOW TO PROVE IT WAS DONE:                                                   │
+│   - Show data/processed/detector_yolo_aug/images/train/ in file explorer   │
+│     with file count (should be ~79,000 files vs ~26,000 in detector_yolo/) │
+│   - Open augmented files: filenames end in _aug0.jpg, _aug1.jpg, _aug2.jpg │
+│   - Side-by-side in any viewer: original vs _aug0 vs _aug1 vs _aug2        │
+│   - Run augment.py and screenshot the progress output with file counts     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+  QUICK CODE TO GENERATE AUGMENTATION GRID FOR YOUR SLIDES
+  (Run this in a notebook cell — produces the Figure H grid image)
+================================================================================
+
+  import sys
+  sys.path.insert(0, '../src')
+  import cv2, random, torch, numpy as np, matplotlib.pyplot as plt
+  from pathlib import Path
+  from augment import add_rain, add_fog, add_night, add_wet_road, img_to_tensor, tensor_to_img
+
+  BASE_DIR = Path('..').resolve()
+  val_imgs = sorted((BASE_DIR/'data/processed/detector_yolo/images/val').glob('*'))[:5]
+  effects  = [('Original', lambda t: t), ('Rain', add_rain),
+              ('Fog', add_fog), ('Night', add_night), ('Wet Road', add_wet_road)]
+
+  fig, axes = plt.subplots(5, 5, figsize=(16, 16))
+  for col, img_path in enumerate(val_imgs):
+      frame = cv2.imread(str(img_path))
+      t     = img_to_tensor(frame)
+      for row, (name, fn) in enumerate(effects):
+          result = tensor_to_img(fn(t.clone()))
+          axes[row][col].imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+          axes[row][col].axis('off')
+          if col == 0:
+              axes[row][col].set_ylabel(name, fontsize=12, fontweight='bold')
+  plt.suptitle('Data Augmentation — Weather Effects', fontsize=14, fontweight='bold')
+  plt.tight_layout()
+  plt.savefig('augmentation_grid.png', dpi=150, bbox_inches='tight')
+  plt.show()
+
+
+================================================================================
+  QUICK CODE TO VISUALISE BLUR DETECTION FOR YOUR SLIDES
+  (Figure A — proves Laplacian blur filter works)
+================================================================================
+
+  import cv2, matplotlib.pyplot as plt, numpy as np
+  from pathlib import Path
+
+  # Pick one sharp and one blurry frame (or use any two images)
+  BASE_DIR   = Path('..').resolve()
+  imgs       = sorted((BASE_DIR/'data/raw/dashcam_frames').glob('*.jpg'))[:20]
+
+  scores     = [(cv2.Laplacian(cv2.imread(str(p), cv2.IMREAD_GRAYSCALE),
+                               cv2.CV_64F).var(), p) for p in imgs]
+  sharp_path = max(scores)[1]
+  blurry_path= min(scores)[1]
+
+  fig, axes  = plt.subplots(2, 3, figsize=(14, 8))
+  for row, (path, label) in enumerate([(sharp_path,'KEPT'), (blurry_path,'REJECTED')]):
+      img  = cv2.imread(str(path))
+      gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+      lap  = cv2.Laplacian(gray, cv2.CV_64F)
+      score= lap.var()
+      axes[row][0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+      axes[row][0].set_title(f'{label}  —  Original', fontweight='bold')
+      axes[row][1].imshow(gray, cmap='gray')
+      axes[row][1].set_title('Greyscale')
+      axes[row][2].imshow(np.abs(lap), cmap='hot')
+      axes[row][2].set_title(f'Laplacian  (variance = {score:.1f})')
+      for ax in axes[row]: ax.axis('off')
+  plt.suptitle('Blur Detection via Laplacian Variance', fontsize=13, fontweight='bold')
+  plt.tight_layout()
+  plt.savefig('blur_detection.png', dpi=150, bbox_inches='tight')
+  plt.show()
+
+
+================================================================================
+  COMPLETE CV/IP TECHNIQUE REFERENCE — ONE-LINE SUMMARY PER TECHNIQUE
+================================================================================
+
+  Technique                 CV/IP Category             Where Used
+  ─────────────────────────────────────────────────────────────────────────────
+  Laplacian operator        2nd-order edge derivative  Blur detection (frame filter)
+  Perceptual hashing (DCT)  Frequency domain transform Near-duplicate frame removal
+  Coordinate normalisation  Geometric transformation   VOC/CSV/YAML → YOLO format
+  ROI extraction + padding  Spatial cropping           Pothole severity crops
+  Area ratio heuristic      Spatial measurement        Severity auto-labelling
+  1D vertical convolution   Spatial filtering          Rain streak simulation
+  Alpha blending            Image compositing          Fog simulation
+  Point operation (gamma)   Intensity transform        Night simulation
+  HSV saturation adjust     Colour space manipulation  Wet road simulation
+  GPU tensor processing     Parallel computation       All augmentation ops
+
+
+================================================================================
+  FINAL PRESENTATION SLIDES GUIDE
+================================================================================
+
+STORY IN ONE SENTENCE:
+  "Raw dashcam videos and public datasets were unusable for training directly —
+   we applied four CV/IP techniques to turn them into a clean, diverse,
+   weather-robust training dataset."
+
+STRUCTURE: 5 slides, ~5 minutes total
+FOCUS: 4 techniques only — the most visual and most valuable ones.
+
+  Technique 1 → Laplacian Blur Detection         (cleans dashcam frames)
+  Technique 2 → Perceptual Hashing / DCT         (removes duplicates)
+  Technique 3 → ROI Extraction + Auto-labelling  (builds severity dataset)
+  Technique 4 → Weather Augmentation             (makes model weather-proof)
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 1 — "THE PROBLEM WITH RAW DATA"
+────────────────────────────────────────────────────────────────────────────────
+
+  Headline:  "Our data had 3 problems before a single model could be trained."
+
+  Show 3 problem boxes:
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │ Problem 1: Dashcam videos had 108,000 frames per hour.      │
+    │            Most were blurry or near-identical.              │
+    ├─────────────────────────────────────────────────────────────┤
+    │ Problem 2: 4 public datasets, 4 different label formats.    │
+    │            VOC XML, CSV, YAML — none ready for YOLO.        │
+    ├─────────────────────────────────────────────────────────────┤
+    │ Problem 3: Every dataset was clear-weather only.            │
+    │            Model would fail in rain, fog, and night.        │
+    └─────────────────────────────────────────────────────────────┘
+
+  Then the solution arrow:
+    3 Problems  →  3 preprocessing stages  →  Training-ready dataset
+
+  Say: "Each problem was solved with a specific image processing technique."
+
+  TIME: 30 seconds. No code. No math. Just the problem statement.
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 2 — "CLEANING DASHCAM FRAMES"
+         Technique 1: Laplacian Operator + Technique 2: Perceptual Hashing
+────────────────────────────────────────────────────────────────────────────────
+
+  Headline:  "We used the Laplacian operator and perceptual hashing to keep
+              only the frames worth annotating."
+
+  LEFT HALF — BLUR DETECTION (Laplacian Operator)
+    Concept:  Sharp image → strong edges → HIGH Laplacian variance
+              Blurry image → weak edges → LOW Laplacian variance
+    Visual:   2 rows side by side:
+              Row 1: Sharp frame | Laplacian heatmap (bright, busy)  → KEPT
+              Row 2: Blurry frame | Laplacian heatmap (dark, flat)   → REJECTED
+    Threshold: Variance > 60 = kept.  Variance < 60 = rejected.
+
+  RIGHT HALF — DUPLICATE REMOVAL (Perceptual Hashing / DCT)
+    Concept:  Each frame is compressed to a 64-bit fingerprint using DCT
+              (same transform inside JPEG). Two frames with ≤ 6 differing
+              bits out of 64 are considered identical → discard one.
+    Visual:   3 frames from the same road stretch (nearly identical)
+              → Only 1 kept, 2 rejected.
+              Below each: a tiny 8×8 black/white DCT hash grid.
+
+  RESULT BAR at slide bottom:
+    108,000 raw frames  →  2,400 diverse, sharp frames
+
+  FIGURE: Run the blur_detection code (see code appendix below).
+          Screenshot 3 similar dashcam frames from data/raw/dashcam_frames/.
+
+  TIME: 1 minute.
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 3 — "FORMAT UNIFICATION + AUTOMATIC SEVERITY LABELS"
+         Technique 3: Coordinate Normalisation + ROI Extraction
+────────────────────────────────────────────────────────────────────────────────
+
+  Headline:  "We unified 4 annotation formats and automatically generated
+              severity labels using spatial geometry — no manual work."
+
+  TOP HALF — FORMAT UNIFICATION
+    Show conversion diagram:
+
+      VOC XML   ──┐
+      LISA CSV  ──┼──  coordinate normalisation  ──►  YOLO .txt
+      Bosch YAML──┘       xc = (xmin+xmax) / (2×W)   class  xc  yc  w  h
+      Our own   ──┘       w  = (xmax−xmin) / W        (all values 0 – 1)
+
+    Say: "YOLO needs normalised [0,1] coordinates. All four formats used
+          absolute pixel coordinates. We converted every annotation."
+
+  BOTTOM HALF — SEVERITY AUTO-LABELLING
+    The insight: larger bounding box = closer/bigger pothole = more dangerous.
+    Measurement: box area ÷ image area
+
+    Show 3 example images with boxes of different sizes:
+      [Small box]   ratio = 1.8%  →  LOW    (distant pothole)
+      [Medium box]  ratio = 7%    →  MEDIUM
+      [Large box]   ratio = 15%   →  HIGH   (close, large — high danger)
+
+    Then: arrow showing crop extraction (box + 10px padding → 128×128 ROI)
+
+    Say: "Zero manual severity annotations.
+          Geometric spatial analysis labels all crops automatically."
+
+  FIGURE: Run notebook 07-validation.ipynb → Section 1 → screenshot crop grid.
+          Draw format conversion diagram in PowerPoint.
+
+  TIME: 1 minute.
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 4 — "MAKING THE MODEL WEATHER-PROOF"  ← THE SHOWSTOPPER SLIDE
+         Technique 4: Weather Augmentation (4 IP techniques in one slide)
+────────────────────────────────────────────────────────────────────────────────
+
+  Headline:  "Four image processing techniques turned every clear-day image
+              into 4 training samples — one for each weather condition."
+
+  MAIN FIGURE — 5 rows × 5 columns grid:
+
+               Image 1    Image 2    Image 3    Image 4    Image 5
+    Original     [ ]        [ ]        [ ]        [ ]        [ ]
+    Rain         [ ]        [ ]        [ ]        [ ]        [ ]
+    Fog          [ ]        [ ]        [ ]        [ ]        [ ]
+    Night        [ ]        [ ]        [ ]        [ ]        [ ]
+    Wet Road     [ ]        [ ]        [ ]        [ ]        [ ]
+
+  SIDE TABLE (place right of the grid):
+
+    ┌────────────┬──────────────────────────────┐
+    │ Rain       │ 1D Vertical Convolution      │
+    │            │ (motion blur kernel)         │
+    ├────────────┼──────────────────────────────┤
+    │ Fog        │ Alpha Blending               │
+    │            │ image×(1−α) + white×α        │
+    ├────────────┼──────────────────────────────┤
+    │ Night      │ Gamma Point Operation        │
+    │            │ pixels × 0.18 – 0.30         │
+    ├────────────┼──────────────────────────────┤
+    │ Wet Road   │ HSV Saturation Boost         │
+    │            │ S channel × 1.2 – 1.5        │
+    └────────────┴──────────────────────────────┘
+
+  RESULT BAR at slide bottom:
+    26,000 training images  →  79,000 training images  (3× expansion)
+    All bounding box labels preserved — augmentation is photometric only.
+
+  FIGURE: Run augmentation_grid code (see code appendix below).
+          Saves as augmentation_grid.png — drop directly onto the slide.
+
+  TIME: 1.5 minutes. Let the grid speak. It proves everything visually.
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE 5 — "WHAT WE PRODUCED"  (proof slide)
+────────────────────────────────────────────────────────────────────────────────
+
+  Headline:  "The preprocessing pipeline produced 3 ready-to-train datasets."
+
+  TABLE:
+
+    ┌──────────────────────────┬──────────┬──────────┬──────────┬────────────────────┐
+    │ Dataset                  │  Train   │   Val    │   Test   │ Used for           │
+    ├──────────────────────────┼──────────┼──────────┼──────────┼────────────────────┤
+    │ Detector (original)      │ ~18,000  │ ~5,200   │ ~2,600   │ Stage 1 training   │
+    │ Detector (augmented)     │ ~79,000  │  same    │  same    │ Stage 1 full run   │
+    │ Severity crops           │   70%    │   20%    │   10%    │ Stage 2 classifier │
+    │   Low / Medium / High    │          │          │          │                    │
+    └──────────────────────────┴──────────┴──────────┴──────────┴────────────────────┘
+
+  PROOF SCREENSHOTS (take before presentation, place below table):
+    1. Windows Explorer: data/processed/detector_yolo_aug/images/train/
+       with file count visible in status bar (~79,000 files)
+    2. Notebook 07-validation.ipynb Section 1 — bar charts
+       (class distribution + train/val/test counts)
+    3. severity_crops/ folder tree showing Low/ Medium/ High/ subfolders
+
+  TIME: 45 seconds.
+
+────────────────────────────────────────────────────────────────────────────────
+SLIDE SEQUENCE AT A GLANCE
+────────────────────────────────────────────────────────────────────────────────
+
+  Slide   Title                                    Time      Key Visual
+  ──────────────────────────────────────────────────────────────────────────
+  1       The Problem With Raw Data                30 sec    3-box problem diagram
+  2       Cleaning Dashcam Frames                  1 min     Laplacian heatmaps
+                                                             + pHash grid
+  3       Format Unification + Auto-labelling      1 min     Conversion diagram
+                                                             + 3 severity crops
+  4       Making the Model Weather-Proof           1.5 min   5×5 augmentation grid
+  5       What We Produced                         45 sec    Table + screenshots
+  ──────────────────────────────────────────────────────────────────────────
+  TOTAL                                            ~5 min
+
+────────────────────────────────────────────────────────────────────────────────
+PRE-PRESENTATION CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+  [ ] Run blur_detection code → save blur_detection.png
+  [ ] Run augmentation_grid code → save augmentation_grid.png
+  [ ] Run notebook 07-validation.ipynb Section 1 → screenshot charts
+  [ ] Windows Explorer → detector_yolo_aug/images/train/ → screenshot file count
+  [ ] Windows Explorer → severity_crops/ → screenshot folder tree
+  [ ] Pick 3 near-identical dashcam frames from data/raw/dashcam_frames/
+
+────────────────────────────────────────────────────────────────────────────────
+3 ANSWERS FOR AUDIENCE QUESTIONS
+────────────────────────────────────────────────────────────────────────────────
+
+  "Why did you filter blurry frames?"
+    "A blurry frame has no detectable edge. Training on it teaches the model
+     to draw boxes around nothing."
+
+  "Why did you augment the data?"
+    "Road hazards don't disappear when it rains. Our model shouldn't either."
+
+  "Why didn't you manually label severity?"
+    "A pothole that fills 15% of your windscreen is more urgent than one
+     that covers 2%. Geometry does the labelling for us."
+
+────────────────────────────────────────────────────────────────────────────────
+CODE APPENDIX — GENERATE FIGURES
+────────────────────────────────────────────────────────────────────────────────
+
+-- Figure: blur_detection.png (for Slide 2) --
+
+  import sys; sys.path.insert(0, '../src')
+  import cv2, numpy as np, matplotlib.pyplot as plt
+  from pathlib import Path
+
+  frames_dir = Path('..').resolve() / 'data/raw/dashcam_frames'
+  imgs = sorted(frames_dir.glob('*.jpg'))[:30]
+  scores = [(cv2.Laplacian(cv2.imread(str(p), 0), cv2.CV_64F).var(), p)
+            for p in imgs]
+  sharp  = max(scores)[1]
+  blurry = min(scores)[1]
+
+  fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+  for row, (path, label, score) in enumerate([
+      (sharp,  'KEPT',     max(scores)[0]),
+      (blurry, 'REJECTED', min(scores)[0])
+  ]):
+      img  = cv2.imread(str(path))
+      gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+      lap  = np.abs(cv2.Laplacian(gray, cv2.CV_64F))
+      axes[row][0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+      axes[row][0].set_title(f'{label} — Original', fontweight='bold')
+      axes[row][1].imshow(gray, cmap='gray')
+      axes[row][1].set_title('Greyscale')
+      axes[row][2].imshow(lap, cmap='hot')
+      axes[row][2].set_title(f'Laplacian  (var = {score:.0f})')
+      for ax in axes[row]: ax.axis('off')
+  plt.suptitle('Laplacian Blur Detection', fontsize=14, fontweight='bold')
+  plt.tight_layout()
+  plt.savefig('blur_detection.png', dpi=150, bbox_inches='tight')
+  plt.show()
+
+-- Figure: augmentation_grid.png (for Slide 4) --
+
+  import sys; sys.path.insert(0, '../src')
+  import cv2, matplotlib.pyplot as plt
+  from pathlib import Path
+  from augment import add_rain, add_fog, add_night, add_wet_road
+  from augment import img_to_tensor, tensor_to_img
+
+  imgs    = sorted((Path('..').resolve() /
+                    'data/processed/detector_yolo/images/val').glob('*.jpg'))[:5]
+  effects = [('Original', lambda t: t), ('Rain',     add_rain),
+             ('Fog',      add_fog),     ('Night',    add_night),
+             ('Wet Road', add_wet_road)]
+
+  fig, axes = plt.subplots(5, 5, figsize=(16, 14))
+  for col, p in enumerate(imgs):
+      t = img_to_tensor(cv2.imread(str(p)))
+      for row, (label, fn) in enumerate(effects):
+          out = tensor_to_img(fn(t.clone()))
+          axes[row][col].imshow(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+          axes[row][col].axis('off')
+          if col == 0:
+              axes[row][col].set_ylabel(label, fontsize=12, fontweight='bold',
+                                        rotation=0, labelpad=55, va='center')
+  plt.suptitle('Weather Augmentation — Data Preprocessing',
+               fontsize=14, fontweight='bold')
+  plt.tight_layout()
+  plt.savefig('augmentation_grid.png', dpi=150, bbox_inches='tight')
+  plt.show()
+
+
+================================================================================
+  END
+================================================================================

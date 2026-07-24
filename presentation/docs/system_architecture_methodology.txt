@@ -1,0 +1,513 @@
+================================================================================
+  SMART ROAD ASSISTANT — GROUP 35
+  SYSTEM ARCHITECTURE & METHODOLOGY
+================================================================================
+
+
+================================================================================
+  OVERVIEW
+================================================================================
+
+The system is a two-stage cascading inference pipeline built on top of a YOLOv8
+object detector, with classical CV handling all post-detection analysis. No deep
+learning is used after Stage 1 except the optional severity classifier.
+
+Architecture pattern: Single detector → parallel analysers → lane-based merge
+
+
+================================================================================
+  ALL MODELS USED
+================================================================================
+
+  Model                    Type                  File
+  -----------------------  --------------------  ---------------------------
+  YOLOv8s Detector         Object Detection      models/detector_model.pt
+  YOLOv8s Detector Dashcam Object Detection      models/detector_dashcam.pt
+  YOLOv8n-cls Severity     Image Classification  models/severity_model.pt
+  COCO YOLOv8s             Object Detection      pretrained (data prep only)
+
+  Notes:
+  - detector_model.pt       : trained on photos (640 px inference)
+  - detector_dashcam.pt     : same architecture, fine-tuned on dashcam
+                              perspective for video (1280 px inference)
+  - severity_model.pt       : nano classification model, 3 classes
+                              (Low / Medium / High), input 128x128
+  - COCO YOLOv8s            : used ONLY during pseudo-labeling of traffic
+                              videos, not used at inference time
+
+
+================================================================================
+  ALL CV & IMAGE PROCESSING METHODS
+================================================================================
+
+  Method                          Where Used                  Purpose
+  ------------------------------  --------------------------  ------------------
+  Canny Edge Detection            Lane det. + Pothole CV      Road marking edges;
+                                                              edge density score
+  HoughLinesP                     Lane detection              Detect straight line
+                                                              candidates from mask
+  HLS Color Thresholding          Lane detection              Isolate white and
+                                                              yellow lane markings
+  HSV Color Thresholding          Traffic light color det.    Identify Red/Yellow/
+                                                              Green pixels
+  Polynomial fitting (polyfit)    Lane detection              Fit curved lane edges
+                                                              from Hough candidates
+  Vanishing Point computation     Lane detection              Geometric convergence
+                                                              of left/right edges
+  Trapezoid ROI masking           Lane detection              Restrict processing to
+                                                              road-ahead region
+  Slope filtering                 Lane detection              Reject near-horizontal
+                                                              and near-vertical lines
+  Brightness / V-channel thirds   Traffic light color det.    Position-based vote
+                                                              (top=Red, mid=Yellow,
+                                                              bot=Green)
+  Laplacian variance              Frame extraction            Blur detection: discard
+                                                              blurry video frames
+  Perceptual Hash (pHash/DCT)     Frame extraction            Deduplication: discard
+                                                              near-identical frames
+  ByteTrack temporal tracking     Video pipeline              Stabilise detections
+                                                              across frames
+  Geometric lane-in-box test      Pothole filtering           Check if pothole is
+                                                              inside lane corridor
+  Lane relevance scoring          Traffic light filtering     Select traffic light
+                                                              most relevant to ego
+                                                              lane
+  Laplacian-based depth scoring   Pothole CV scorer           Center vs border
+                                                              brightness -> pit depth
+  Texture scoring (std dev)       Pothole CV scorer           Intensity variation of
+                                                              pothole surface
+  Weather augmentation (Torch)    Training data prep          Rain, fog, night,
+                                                              wet-road variants
+
+
+================================================================================
+  COMPLETE DATA FLOW DIAGRAM
+================================================================================
+
+  +-------------------------------------------------------------------+
+  |                     INPUT FRAME (BGR)                             |
+  |         Photo (640 px inference) / Video (1280 px)               |
+  +-----------------------------+-------------------------------------+
+                                |
+                                v
+  +-------------------------------------------------------------------+
+  |              STAGE 1 -- YOLOv8s OBJECT DETECTOR                  |
+  |       detector_model.pt  /  detector_dashcam.pt (video)          |
+  |                                                                   |
+  |  Classes:  0 = pothole      1 = traffic_light                    |
+  |  Conf threshold: 0.35   NMS IoU: 0.45                            |
+  |  Video only: ByteTrack temporal tracking across frames           |
+  |  (confirm TL: 3 consecutive frames OR confidence >= 0.50)        |
+  +----------+-------------------------------+------------------------+
+             |                               |
+             | Pothole detections            | Traffic light detections
+             v                               v
+  +--------------------+        +----------------------------------+
+  | STAGE 2a           |        | STAGE 2b                         |
+  | POTHOLE ANALYZER   |        | TRAFFIC LIGHT ANALYZER           |
+  |                    |        |                                  |
+  | Crop extraction:   |        | Crop extraction:                 |
+  | frame[y1:y2,x1:x2] |        | frame[y1:y2,x1:x2]              |
+  |                    |        |                                  |
+  | -- CNN path --     |        | Resize crop to 48x144            |
+  | severity_model.pt  |        |                                  |
+  | YOLOv8n-cls @128px |        | Vote 1: Position (brightness)    |
+  | -> Low/Med/High    |        | -> measure V-channel per third   |
+  |                    |        | -> brightest third = color       |
+  | -- CV path --      |        |                                  |
+  | Canny edges        |        | Vote 2: HSV thresholding         |
+  | -> edge density    |        | -> mask Red/Yellow/Green pixels  |
+  | Center vs border   |        | -> most pixels = color           |
+  | -> depth score     |        |                                  |
+  | Std dev intensity  |        | Combine votes:                   |
+  | -> texture score   |        | both agree  -> conf 1.0          |
+  | Weighted sum       |        | one vote    -> conf 0.5          |
+  | -> Low/Med/High    |        | <2% pixels  -> Unknown, conf 0.0 |
+  |                    |        |                                  |
+  | Distance estimate: |        | False-positive rejection:        |
+  | box_bottom / height|        | - conf >= 0.25                   |
+  | -> Very Close      |        | - box center y <= 62% frame      |
+  |    Close           |        | - aspect (h/w) >= 0.80           |
+  |    Medium          |        | - color != Unknown               |
+  |    Far             |        |                                  |
+  +--------+-----------+        | Lane relevance scoring:          |
+           |                    | 0.50 x nearness                  |
+           |                    | 0.30 x centrality to VP          |
+           |                    | 0.05 x mounting height           |
+           |                    | 0.15 x detector confidence       |
+           |                    +----------------+-----------------+
+           |                                     |
+           +------------------+------------------+
+                              |
+                              v
+  +-------------------------------------------------------------------+
+  |               LANE DETECTION  (Classical CV only)                |
+  |                                                                   |
+  |  1. Trapezoid ROI mask                                           |
+  |     horizon = 0.58 x frame height                                |
+  |     hood    = 0.93 x frame height                                |
+  |     width   = +/- 0.13 x frame width at top                     |
+  |              +/- 0.46 x frame width at bottom                   |
+  |                                                                   |
+  |  2. HLS thresholding inside ROI                                  |
+  |     white  : L in [165,255], S in [0,70]                        |
+  |     yellow : H in [15,40], S >= 60, L >= 60                     |
+  |                                                                   |
+  |  3. Canny edge detection on grayscale                            |
+  |     low threshold = 60, high threshold = 150                    |
+  |                                                                   |
+  |  4. Combine (white OR yellow OR edges) AND trapezoid             |
+  |     -> HoughLinesP (rho=1, theta=1deg, threshold=40,            |
+  |        minLineLength = 0.10 x height, maxLineGap = 60)          |
+  |                                                                   |
+  |  5. Slope filter: 0.35 <= |slope| <= 2.5                        |
+  |     -> separate left-leaning and right-leaning candidates        |
+  |                                                                   |
+  |  6. Polynomial fit x = f(y) for each side                       |
+  |     quadratic if >= 8 points AND span >= 14% frame height        |
+  |     linear otherwise                                             |
+  |                                                                   |
+  |  7. Geometry validation (7 checks):                              |
+  |     - edges straddle frame centre                                |
+  |     - lane width at bottom in [0.18w, 0.95w]                    |
+  |     - lane narrows toward horizon                                |
+  |     - vanishing point x in [0.32w, 0.68w]                       |
+  |     - vanishing point y in [0.42h, 0.66h]                       |
+  |     - polyline stays within frame bounds                         |
+  |     FALLBACK: fixed ROI corridor if validation fails             |
+  |                                                                   |
+  |  Output: left_poly, right_poly, vanishing_point, assumed flag    |
+  +---------------------------+---------------------------------------+
+                              |
+                              v
+  +-------------------------------------------------------------------+
+  |           LANE-BASED FILTERING & INTEGRATION                     |
+  |                                                                   |
+  |  Potholes:                                                        |
+  |    geometric test -> keep only potholes whose road-contact point  |
+  |    (bottom-centre of box) falls inside lane corridor             |
+  |                                                                   |
+  |  Traffic lights:                                                  |
+  |    pick single highest-scoring light aligned with VP corridor    |
+  |    -> mark lane_relevant = True                                  |
+  +---------------------------+---------------------------------------+
+                              |
+                              v
+  +-------------------------------------------------------------------+
+  |                          OUTPUT                                   |
+  |                                                                   |
+  |  - Annotated frame (boxes, lane lines, vanishing point)          |
+  |  - Instruction strings                                           |
+  |      e.g. "BRAKE NOW -- Severe pothole directly ahead"           |
+  |      e.g. "STOP -- Red light. Do not proceed."                   |
+  |  - Pothole list: {box, severity, distance, confidence}           |
+  |  - Traffic light: {color, confidence, lane_relevant, instruction}|
+  |  - Lane: {left_poly, right_poly, vanishing_point, assumed}       |
+  +-------------------------------------------------------------------+
+
+
+================================================================================
+  SOURCE FILES
+================================================================================
+
+  File                            Purpose
+  ------------------------------  ----------------------------------------------
+  src/pipeline.py                 Main inference pipeline (Stage 1+2a+2b+lane)
+  src/analyzers/traffic_analyzer.py  Stage 2b: HSV color + lane relevance (CV)
+  src/analyzers/pothole_analyzer.py  Stage 2a: Severity (CV or CNN) + distance
+  src/extract_frames.py           Frame extraction + blur detection + pHash dedup
+  src/augment.py                  Weather augmentation (rain, fog, night, wet)
+  src/train.py                    Train detector (YOLOv8s) and severity (YOLOv8n-cls)
+  src/prepare_data.py             Dataset curation from LISA/Bosch/Kaggle/Chitholian
+  src/benchmark_severity.py       Compare CV vs CNN, auto-select winner
+  src/train_dashcam.py            Train video-specific detector
+  src/prepare_traffic_video.py    Pseudo-label traffic videos (COCO + our model)
+  src/merge_traffic_video.py      Merge corrected frames into main dataset
+
+
+================================================================================
+  MODELS & WEIGHTS FILES
+================================================================================
+
+  models/detector_model.pt        22.7 MB   YOLOv8s, 2 classes (pothole + TL)
+  models/detector_dashcam.pt      22.5 MB   YOLOv8s, same classes, video-trained
+  models/severity_model.pt         3.0 MB   YOLOv8n-cls, 3 classes (Low/Med/High)
+
+
+================================================================================
+  CONFIGURATION PARAMETERS
+================================================================================
+
+  configs/pipeline_config.yaml
+
+  severity_method      : "cnn" | "cv" | "auto"   (auto = CNN if available)
+  detector_conf        : 0.35                     Stage 1 confidence threshold
+  detector_imgsz       : 640                      photo inference resolution
+  video_imgsz          : 1280                     video inference resolution
+  pothole_conf         : 0.40                     stricter pothole filter
+  lane_x_min           : 0.20                     lane lateral bound (fraction)
+  lane_x_max           : 0.80                     lane lateral bound (fraction)
+  lane_min_size_ratio  : 0.001                    min traffic light area fraction
+  tl_min_aspect_ratio  : 1.2                      min height/width for TL box
+
+
+================================================================================
+  METHODOLOGY
+================================================================================
+
+------------------------------------------------------------------------
+  Data Collection & Preparation
+------------------------------------------------------------------------
+
+Raw data comes from four public sources:
+  - Chitholian pothole dataset     (Pascal VOC XML annotations)
+  - Kaggle pothole dataset         (Pascal VOC XML annotations)
+  - LISA traffic light dataset     (CSV annotations)
+  - Bosch traffic light dataset    (YAML annotations)
+
+All annotations are converted to YOLO bounding-box format
+(normalized xc yc w h). The combined dataset is split 70/20/10
+(train / val / test).
+
+Severity classifier labels are auto-generated from bounding box area:
+  box area < 3% of image   -> Low
+  box area 3% -- 12%       -> Medium
+  box area >= 12%          -> High
+
+Video frames for the dashcam detector are extracted with two filters:
+  1. Laplacian variance (threshold 60)  -- reject blurry frames
+  2. pHash Hamming distance <= 6        -- reject near-duplicate frames
+
+Training data is augmented with synthetic weather:
+  Rain   : 700 random drops, 10-22 px vertical motion blur streak
+  Fog    : alpha blend toward white (intensity 0.35 - 0.55)
+  Night  : brightness multiply (0.18 - 0.30) + slight blue channel lift
+  Wet    : saturation x 1.2-1.5, brightness x 0.75-0.90
+
+All augmentation runs on GPU via PyTorch tensor operations.
+
+
+------------------------------------------------------------------------
+  Stage 1 -- Detection (YOLOv8s)
+------------------------------------------------------------------------
+
+A single-shot object detector finds both potholes and traffic lights in
+one forward pass. Two weights files are maintained:
+
+  detector_model.pt    : trained on static road imagery, 640 px input
+  detector_dashcam.pt  : fine-tuned on dashcam perspective, 1280 px
+                         input to resolve distant/small objects
+
+Training details:
+  Base weights  : yolov8s.pt (COCO pre-trained)
+  Optimizer     : AdamW, lr0=0.005, cosine annealing
+  AMP           : enabled (float16 for speed)
+  Batch size    : auto-selected from GPU VRAM (e.g. 16 @ 640 on 8 GB)
+  Mosaic aug    : disabled in last 10 epochs for fine detail recovery
+
+In video mode, ByteTrack associates detections across frames using
+IoU-based matching. A traffic light must appear in 3 consecutive frames
+OR reach 50% confidence before triggering an alert, reducing flicker.
+
+
+------------------------------------------------------------------------
+  Stage 2a -- Pothole Severity (YOLOv8n-cls or Classical CV)
+------------------------------------------------------------------------
+
+Each pothole crop is analysed independently to determine severity and
+distance.
+
+CNN path (severity_model.pt):
+  - YOLOv8n-cls (nano classification, ~2.6M parameters)
+  - Input: crop resized to 128x128
+  - Output: class index -> Low / Medium / High
+  - Class order (alphabetical): High=0, Low=1, Medium=2
+
+Classical CV path (fallback):
+  1. Canny edges (50/150) -> edge density  (weight 0.40)
+  2. Center vs border brightness -> depth score  (weight 0.35)
+  3. Intensity std dev -> texture score  (weight 0.25)
+  4. Weighted sum: >= 0.18 = High, >= 0.10 = Medium, else Low
+
+A benchmark script (benchmark_severity.py) evaluates both methods on
+the held-out test set and writes the winner to pipeline_config.yaml.
+
+Distance estimation:
+  box_bottom_y / frame_height > 0.80  ->  Very Close
+  box_bottom_y / frame_height > 0.60  ->  Close
+  box_bottom_y / frame_height > 0.40  ->  Medium
+  otherwise                           ->  Far
+
+
+------------------------------------------------------------------------
+  Stage 2b -- Traffic Light Colour (Pure Classical CV)
+------------------------------------------------------------------------
+
+No deep learning model is used here. Each detected crop is classified
+using two independent votes.
+
+Vote 1: Position (brightness-based)
+  - Resize crop to 48x144 (standard traffic light shape)
+  - Divide into three equal horizontal thirds
+      top third    -> Red position
+      middle third -> Yellow position
+      bottom third -> Green position
+  - Compute mean V-channel (brightness) per third
+  - Brightest third -> position vote
+
+Vote 2: Colour (HSV thresholding)
+  - Convert crop to HSV
+  - Apply per-colour masks with saturation >= 80 AND value >= 80:
+      Red    : hue  0-10  deg  (wrap-around also 160-180 deg)
+      Yellow : hue 20-35  deg
+      Green  : hue 40-80  deg
+  - Count matched pixels per colour
+  - Colour with most matched pixels -> colour vote
+
+Confidence assignment:
+  Both votes agree        -> confidence 1.0
+  Only one vote available -> confidence 0.5
+  Saturated pixels < 2%  -> Unknown, confidence 0.0
+  (rejects dark/occluded lights and non-light objects)
+
+False-positive rejection (before colour analysis):
+  - Detector confidence >= 0.25
+  - Box centre y <= 62% of frame height (mounted high, not tail lights)
+  - Aspect ratio (height/width) >= 0.80 (tall objects, not wide signs)
+  - Colour result != Unknown
+
+Lane relevance scoring:
+  Each surviving traffic light is scored:
+    lane_score = 0.50 * nearness (box area / max area)
+               + 0.30 * centrality to vanishing point corridor
+               + 0.05 * mounting height
+               + 0.15 * detector confidence
+
+  The single highest-scoring light is marked lane_relevant = True.
+  Only lane-relevant instructions are promoted to primary warnings.
+
+
+------------------------------------------------------------------------
+  Lane Detection (Pure Classical CV)
+------------------------------------------------------------------------
+
+No model. Entire pipeline is deterministic classical CV.
+
+Step 1: Trapezoid ROI
+  Masks out sky, roadside, and car hood.
+  Defined by four image-relative parameters:
+    LANE_HORIZON    = 0.58  (horizon line, 58% down from top)
+    LANE_HOOD       = 0.93  (hood line, 93% down from top)
+    TRAP_TOP_HALF   = 0.13  (half-width at horizon, fraction of frame width)
+    TRAP_BOT_HALF   = 0.46  (half-width at hood)
+
+Step 2: Lane marking extraction (HLS colour space)
+  White markings: L in [165,255], S in [0,70]
+  Yellow markings: H in [15,40], S >= 60, L >= 60
+
+Step 3: Edge detection
+  Grayscale -> Canny (low=60, high=150)
+
+Step 4: Line detection
+  Combined mask (colour OR edges) inside trapezoid ROI
+  -> HoughLinesP(rho=1, theta=pi/180, threshold=40,
+                 minLineLength=0.10*height, maxLineGap=60)
+
+Step 5: Slope filtering and side assignment
+  Keep lines with 0.35 <= |slope| <= 2.5
+  Left-leaning (slope < 0, centre x < frame centre)
+  Right-leaning (slope > 0, centre x > frame centre)
+
+Step 6: Polynomial fitting x = f(y)
+  Each line segment extrapolated to frame bottom for contact point.
+  If >= 8 points AND height span >= 14% frame -> quadratic fit
+  Otherwise -> linear fit
+
+Step 7: Geometric validation (7 checks)
+  1. Left edge x < frame_centre < right edge x at bottom
+  2. Lane width at bottom in [0.18w, 0.95w]
+  3. Top width <= 1.15 * bottom width (narrows toward horizon)
+  4. Vanishing point x in [0.32w, 0.68w]
+  5. Vanishing point y in [0.42h, 0.66h]
+  6. Polyline stays within [-0.15w, 1.15w] horizontal bounds
+  If any check fails -> fallback to fixed ROI corridor
+
+Fallback ROI:
+  Straight corridor from bottom centre converging to frame centre.
+  Left:  38% of width (bottom) -> 50% (top)
+  Right: 62% of width (bottom) -> 50% (top)
+
+Output:
+  left_poly, right_poly : list of (x,y) points including vanishing point
+  assumed               : True if fallback, False if detected
+  confident             : True if validated lane was found
+
+
+------------------------------------------------------------------------
+  Integration & Output
+------------------------------------------------------------------------
+
+Pothole filtering:
+  The road-contact point of each pothole (bottom-centre of bounding box)
+  is tested against the detected lane corridor using line parameterisation
+  x_at(y). Potholes outside the corridor are deprioritised.
+
+Traffic light selection:
+  All traffic lights that pass false-positive rejection are scored.
+  The single highest lane_score light is flagged as lane_relevant.
+  Instructions for lane_relevant lights use assertive language
+  (e.g. "STOP -- Red light. Do not proceed.").
+  Non-lane-relevant lights use advisory language
+  (e.g. "Red light detected in adjacent lane -- stay alert.").
+
+Instruction generation matrix:
+  Potholes:
+    High   x Very Close -> "BRAKE NOW! Severe pothole directly ahead."
+    High   x Close      -> "Reduce speed immediately. Severe pothole ahead."
+    High   x Medium     -> "Slow down. Large pothole in your path."
+    High   x Far        -> "Hazard ahead -- prepare to slow down."
+    Medium x Very Close -> "Avoid this lane if safe. Moderate pothole."
+    Medium x Close      -> "Slow down. Moderate pothole ahead."
+    ...
+
+  Traffic lights (lane_relevant=True):
+    Red    -> "STOP -- Red light. Do not proceed."
+    Yellow -> "SLOW DOWN -- Yellow light. Prepare to stop."
+    Green  -> "PROCEED -- Green light. Check for crossing hazards."
+
+  Traffic lights (lane_relevant=False):
+    Red    -> "Red light detected in adjacent lane -- stay alert."
+    ...
+
+
+================================================================================
+  TECHNICAL SUMMARY TABLE
+================================================================================
+
+  Component             Model/Algorithm          Input -> Output
+  --------------------  -----------------------  ----------------------------
+  Stage 1 Detector      YOLOv8s                  640/1280 px BGR frame
+                                                 -> bounding boxes + class +
+                                                    confidence
+  Pothole Severity      YOLOv8n-cls (CNN)        pothole crop BGR
+    (CNN path)                                   -> Low / Medium / High
+  Pothole Severity      Canny + brightness +     pothole crop BGR
+    (CV path)           texture weighted sum     -> Low / Medium / High
+  Traffic Light Color   HSV thresholding +       TL crop BGR
+                        brightness thirds        -> Red/Yellow/Green/Unknown
+  Lane Detection        Canny + HoughLinesP +    full frame BGR
+                        polyfit                  -> lane geometry or None
+  Lane Relevance        Geometry scoring         TL box + frame + VP
+                                                 -> boolean + score
+  Temporal Tracking     ByteTrack                frame + detections
+                                                 -> tracked detection IDs
+  Frame Dedup           Perceptual Hash (DCT)    frame BGR -> gray
+                                                 -> 64-bit hash
+  Blur Detection        Laplacian variance       frame BGR -> gray
+                                                 -> float score (>= 60 = sharp)
+  Weather Augment       PyTorch tensor ops       image tensor
+                                                 -> augmented tensor
+
+================================================================================
+  END
+================================================================================

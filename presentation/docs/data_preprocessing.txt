@@ -1,0 +1,439 @@
+================================================================================
+  SMART ROAD ASSISTANT — DATA PREPROCESSING (FULL DETAILS)
+  Computer Vision Project | Group 35
+================================================================================
+
+There are THREE preprocessing code files. Each has a clear responsibility:
+
+  File 1 :  src/extract_frames.py   — Extract usable frames from dashcam videos
+  File 2 :  src/prepare_data.py     — Convert + merge + split all datasets into
+                                       YOLO format
+  File 3 :  src/augment.py          — Expand training data with weather effects
+
+
+================================================================================
+  FILE 1 — src/extract_frames.py
+  PURPOSE: Turn raw dashcam video files into a clean set of still images
+           ready for manual annotation.
+================================================================================
+
+WHY THIS STEP EXISTS
+────────────────────
+Real dashcam footage is a continuous video — you cannot feed a video directly
+into a labelling tool. You need individual image frames. But not every frame is
+useful: a dashcam video at 30 FPS gives 1,800 frames per minute. Taking every
+frame would produce thousands of near-identical, redundant images. Two specific
+problems need to be filtered:
+  - Duplicate frames  : consecutive frames look almost identical (car barely moved)
+  - Blurry frames     : motion blur during bumps / fast turns makes boxes unreliable
+
+PREPROCESSING STEPS IN THIS FILE
+──────────────────────────────────
+
+Step 1 — Time-based Sampling
+  Function : extract_from_video()
+  What     : Instead of taking every frame, the video is stepped through at a
+             fixed time interval (default: one frame every 1.5 seconds).
+  Code     : step = max(int(round(fps * every_sec)), 1)
+             cap.grab() advances the frame pointer; cap.retrieve() decodes only
+             the sampled frames — faster than decoding all frames.
+  Why      : A typical dashcam trip at 30 FPS × 60 min = 108,000 frames.
+             Sampling every 1.5 s reduces this to ~2,400 candidate frames —
+             a manageable number for manual annotation without losing coverage.
+
+Step 2 — Blur Detection (Laplacian Variance)
+  Function : _blur_score(gray)
+  What     : Computes the variance of the Laplacian of the greyscale frame.
+  Code     : cv2.Laplacian(gray, cv2.CV_64F).var()
+             Frames below threshold (default: 60.0) are discarded.
+  Why      : The Laplacian is a second-order derivative — it measures how much
+             contrast change exists at edges. A sharp image has high edge contrast
+             → high variance. A blurry image has smoothed edges → low variance.
+             Annotating a blurry frame gives an unreliable bounding box because
+             the pothole boundary is not visible. Training on such boxes hurts
+             the model.
+
+Step 3 — Near-Duplicate Removal (Perceptual Hashing)
+  Function : _phash(gray), _hamming(a, b)
+  What     : Computes a 64-bit perceptual hash (pHash) of each kept frame,
+             then compares it to the last 30 kept frames using Hamming distance.
+             If the distance is <= 6 bits, the new frame is too similar and
+             is discarded.
+  Code (pHash):
+             small = cv2.resize(gray, (32, 32))  ← shrink to 32x32
+             dct   = cv2.dct(small)[:8, :8]      ← keep top-left 8x8 DCT coefficients
+             return dct > np.median(dct)         ← binarize → 64-bit hash
+  Code (compare):
+             np.count_nonzero(a != b)            ← count differing bits
+  Why      : Two frames taken 1.5 s apart on a slow road may look almost
+             identical. The pHash captures the overall frequency structure of
+             an image in 64 bits. Similar images have hashes that differ in
+             very few bits. A threshold of 6 means: if fewer than 6 of the
+             64 bits differ, the frames are considered duplicates.
+             This avoids having your annotation set filled with near-identical
+             images that teach the model nothing new.
+
+Step 4 — File Saving
+  What     : Kept frames are saved as high-quality JPEG (quality=92) with
+             filenames encoding video name, frame number, and timestamp:
+             {video_name}_f{frame:06d}_t{time:07.1f}.jpg
+  Why      : The timestamp in the filename lets you trace back to the original
+             video if you need to re-examine a specific annotation.
+
+OUTPUT:  data/raw/dashcam_frames/  — clean, diverse, sharp JPG frames
+
+
+================================================================================
+  FILE 2 — src/prepare_data.py
+  PURPOSE: Convert all four raw datasets from their different formats into a
+           single unified YOLO-format dataset ready for training.
+================================================================================
+
+WHY THIS STEP EXISTS
+────────────────────
+Each dataset uses a different annotation format. YOLO training requires one
+specific format. Before any training can happen, all annotation formats must be
+converted and all datasets must be merged into a consistent directory structure.
+
+PREPROCESSING STEPS IN THIS FILE
+──────────────────────────────────
+
+Step 1 — Pascal VOC XML Parsing (Chitholian + Kaggle)
+  Function : parse_pothole_xml(xml_file), gather_pothole_chitholian(),
+             gather_pothole_kaggle()
+  What     : Reads each .xml file with Python's xml.etree.ElementTree.
+             Extracts: image filename, image width/height, and all <bndbox>
+             elements (xmin, xmax, ymin, ymax in pixel coordinates).
+             Only objects with name = "pothole" are kept.
+  Code     :
+             tree  = ET.parse(xml_file)
+             root  = tree.getroot()
+             size  = root.find("size")
+             img_w = int(size.find("width").text)
+             for obj in root.iter("object"):
+                 xmlbox = obj.find("bndbox")
+                 boxes.append((xmin, xmax, ymin, ymax))
+  Why      : Pascal VOC XML uses absolute pixel coordinates. YOLO needs
+             normalised values between 0 and 1. The parser extracts the raw
+             pixel coords for the next conversion step.
+
+Step 2 — LISA CSV Parsing
+  Function : parse_lisa_annotations(), normalize_traffic_label(),
+             resolve_lisa_image_path(), identify_lisa_set()
+  What     : LISA stores annotations in CSV files named
+             frameAnnotationsBOX.csv — one per video sequence,
+             semicolon-delimited. Reads columns: Filename, Annotation tag,
+             Upper left corner X/Y, Lower right corner X/Y.
+             Label normalisation collapses "go", "goLeft", "goForward" etc.
+             all to "traffic_light" (we only need one class).
+             Image path resolution handles the fact that the same filename
+             may exist in multiple sequences — matched by set name.
+  Why      : LISA has 43,000+ annotations across many sequences with
+             inconsistent path structures. The resolver prevents mis-matching
+             an annotation to the wrong image when the same filename appears
+             in multiple sub-folders.
+
+Step 3 — Bosch YAML Parsing
+  Function : parse_bosch_yaml_file(), parse_bosch_annotations(),
+             resolve_bosch_image_path()
+  What     : Bosch uses a hand-rolled YAML format (not strict YAML) that
+             cannot be parsed with a standard YAML library. Parsed line-by-line
+             with regex: r"(\w+):\s*([^,}]+)" extracts fields from inline
+             brace notation.
+             Image paths starting with /net/ are server paths from the original
+             dataset collection — safely skipped.
+  Why      : A standard yaml.safe_load() fails on Bosch's format. Line-by-line
+             regex parsing is more robust to format quirks.
+
+Step 4 — Coordinate Conversion: Pixel → YOLO Normalised
+  Function : convert_bbox_to_yolo(size, box)
+  What     : Converts (xmin, xmax, ymin, ymax) in pixels to
+             (x_center, y_center, width, height) normalised to [0, 1].
+  Code     :
+             x_center = (xmin + xmax) / 2  / image_width
+             y_center = (ymin + ymax) / 2  / image_height
+             width    = (xmax - xmin)      / image_width
+             height   = (ymax - ymin)      / image_height
+  Why      : YOLO stores annotations in this exact format. Using normalised
+             values makes the annotation resolution-independent — the same
+             label file works if the image is resized during training.
+
+Step 5 — Dataset Merging and Class Unification
+  What     : Chitholian and Kaggle are merged into one pothole pool.
+             LISA and Bosch are merged into one traffic light pool.
+             All potholes get class ID = 0, all traffic lights get class ID = 1.
+  Code     :
+             DETECTOR_CLASSES = {"pothole": 0, "traffic_light": 1}
+             f.write(f"0 {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}\n")  ← pothole
+             f.write(f"1 {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}\n")  ← traffic_light
+  Why      : YOLOv8 needs a single dataset with consistent class IDs.
+             Merging from multiple sources increases diversity and total
+             training volume, improving generalisation.
+
+Step 6 — Train / Val / Test Split
+  Function : split_dataset(all_data)
+  What     : Randomly shuffles the combined dataset (seed=42) and splits:
+               70% → train
+               20% → val (validation during training)
+               10% → test (held-out, never seen during training)
+             Done separately for potholes and traffic lights so both classes
+             are proportionally represented in each split.
+  Code     :
+             random.seed(42)
+             random.shuffle(all_data)
+             train_end = int(total * 0.70)
+             val_end   = train_end + int(total * 0.20)
+  Why      : Fixed seed = 42 ensures the split is reproducible — running
+             prepare_data.py twice always gives the same split, which is
+             essential for fair comparison between training runs.
+             Val set is used to monitor overfitting during training.
+             Test set is only used at the end for the final reported metrics.
+
+Step 7 — File Writing (images + label .txt files)
+  Function : write_detector_pothole_files(), write_detector_traffic_files()
+  What     : Copies each image into detector_yolo/images/{split}/ with a
+             source prefix (chitholian_, kaggle_, lisa_, bosch_) added to
+             prevent filename clashes between datasets.
+             Writes one .txt label file per image into
+             detector_yolo/labels/{split}/ in YOLO format.
+             Also generates 5 annotated preview images per split to visually
+             verify the conversion is correct.
+  Why      : Prefixing filenames prevents overwrites when two datasets have
+             files with the same name (common with auto-numbered datasets).
+
+Step 8 — Dataset YAML Generation
+  Function : generate_detector_yaml()
+  What     : Writes detector_yolo/dataset.yaml, which is the config file
+             YOLOv8 reads to find training/val/test images and class names.
+  Content  :
+             path:  data/processed/detector_yolo
+             train: images/train
+             val:   images/val
+             test:  images/test
+             nc: 2
+             names: [pothole, traffic_light]
+  Why      : YOLO's train() API requires this YAML. Without it, training
+             cannot start.
+
+Step 9 — Severity Crop Generation + Auto-Labelling
+  Function : severity_label(), crop_pothole(), write_severity_crops()
+  What     : For every pothole bounding box in the full dataset, the region
+             is cropped from the original image (with 10px padding on all sides)
+             and saved as a 128×128 image into an ImageFolder directory.
+             The severity class is automatically assigned based on the ratio
+             of bounding box area to total image area:
+
+               box_area / image_area < 0.03   →  Low
+               0.03 ≤ ratio < 0.12            →  Medium
+               ratio ≥ 0.12                   →  High
+
+             Crops are also split 70/20/10 (independently from the detector
+             split) and placed in:
+             severity_crops/{train,val,test}/{Low,Medium,High}/
+
+  Code (ratio):
+             box_area   = (xmax - xmin) * (ymax - ymin)
+             image_area = img_w * img_h
+             ratio      = box_area / image_area
+
+  Code (crop):
+             x1 = max(int(xmin) - 10, 0)
+             y1 = max(int(ymin) - 10, 0)
+             x2 = min(int(xmax) + 10, img_w)
+             y2 = min(int(ymax) + 10, img_h)
+             crop = img[y1:y2, x1:x2]
+
+  Why      : A small pothole far away in the frame is less dangerous than a
+             large pothole close to the vehicle. The area-ratio rule captures
+             this: a small box = small pothole (or distant) = Low; a large box
+             = close/big pothole = High. This avoids the need to manually label
+             severity for thousands of crops. The 10px padding ensures the full
+             pothole edge is visible in the crop, giving the classifier enough
+             context.
+
+OUTPUT:
+  data/processed/detector_yolo/       — 2-class YOLO detector dataset
+  data/processed/severity_crops/      — 3-class severity ImageFolder dataset
+
+
+================================================================================
+  FILE 3 — src/augment.py
+  PURPOSE: Expand the training set with synthetic weather variations to improve
+           robustness in real-world driving conditions.
+================================================================================
+
+WHY THIS STEP EXISTS
+────────────────────
+A model trained only on clear-day images will fail when deployed on a real
+dashcam in rain, fog, or at night. All four collected datasets are predominantly
+clear-day images. Instead of collecting new bad-weather data (slow and expensive),
+we synthetically generate weather effects from existing training images.
+Augmentation also 3× the training set size, reducing overfitting on small datasets.
+
+IMPORTANT: Augmentation is applied ONLY to the training split.
+           Validation and test splits stay as clean originals so metrics
+           reflect real performance without augmented data bias.
+
+PREPROCESSING STEPS IN THIS FILE
+──────────────────────────────────
+
+Step 1 — Image-to-Tensor Conversion
+  Function : img_to_tensor(img_bgr)
+  What     : Converts an OpenCV BGR uint8 image (H×W×C) to a PyTorch float32
+             tensor (C×H×W) on the GPU, with pixel values normalised to [0, 1].
+  Code     :
+             rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+             t   = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0)
+             return t.to(DEVICE)
+  Why      : All augmentation operations are implemented as GPU tensor ops.
+             Running on GPU is significantly faster than CPU-based pixel
+             manipulation (e.g., individual cv2.line() calls for rain). Tensors
+             also allow batch operations and clean compositing via arithmetic.
+
+Step 2 — Rain Effect
+  Function : add_rain(t)
+  What     : Places 700 random bright points on a black canvas, then applies
+             a vertical motion-blur convolution kernel to stretch them into
+             downward rain streaks. The streaks are composited onto the image.
+  Code     :
+             rain[0, ys, xs] = uniform(0.6, 1.0)    ← bright dots
+             kernel = vertical 1D conv (length 10–22 px)
+             rain_blurred = F.conv2d(rain, kernel)   ← stretch to streaks
+             result = image * 0.88 + rain * 0.55     ← blend: dim image + rain
+  Why      : The convolution-based approach is ~100× faster than drawing
+             600 individual lines with cv2.line(). Rain reduces image visibility
+             and changes road texture appearance — training on rain images
+             prevents the model from relying on clear texture as a cue.
+
+Step 3 — Fog Effect
+  Function : add_fog(t)
+  What     : Blends the image with a uniform white overlay using a random
+             intensity between 0.35 and 0.55.
+  Code     :
+             result = image * (1.0 - intensity) + intensity
+             where intensity = uniform(0.35, 0.55)
+  Why      : Fog reduces contrast globally. Potholes in foggy conditions have
+             lower edge contrast and less distinct texture. Training on fog
+             images ensures the model does not rely on high-contrast edges
+             as its sole detection signal.
+
+Step 4 — Night Effect
+  Function : add_night(t)
+  What     : Multiplies the image by a low brightness factor (0.18–0.30) and
+             adds a slight blue tint to the blue channel to simulate artificial
+             street lighting.
+  Code     :
+             out    = image * brightness       ← brightness = uniform(0.18, 0.30)
+             out[2] = clamp(out[2] + 0.04)    ← blue channel boost
+  Why      : Dashcam footage is often captured at night or in poorly lit
+             tunnels. A model that has never seen dark images will miss potholes
+             in these conditions. The blue tint simulates the colour cast of LED
+             streetlights.
+
+Step 5 — Wet Road Effect
+  Function : add_wet_road(t)
+  What     : Increases saturation (1.2–1.5×) and slightly reduces brightness
+             (0.75–0.90×) using torchvision transforms to simulate a wet,
+             reflective road surface.
+  Code     :
+             TF.adjust_saturation(image, uniform(1.2, 1.5))
+             TF.adjust_brightness(image, uniform(0.75, 0.90))
+  Why      : Wet roads are highly reflective and change road colour from grey
+             to dark, sometimes with specular highlights that resemble potholes.
+             Training on wet-road images reduces false positives caused by
+             reflections.
+
+Step 6 — Effect Composition
+  Function : pick_weather(t)
+  What     : Randomly selects 1 or 2 of the four weather functions and applies
+             them in sequence.
+  Code     :
+             for fn in random.sample(WEATHER_FNS, k=random.randint(1, 2)):
+                 t = fn(t)
+  Why      : Real conditions are often combined (e.g., rain at night, fog on a
+             wet road). Compositing multiple effects creates more realistic and
+             diverse training samples than applying a single effect at a time.
+
+Step 7 — Parallel Processing
+  Function : augment_split(), _process_one()
+  What     : Each image is processed in a separate worker process using Python's
+             multiprocessing.Pool with imap_unordered(). Number of workers =
+             CPU cores − 2 (to leave headroom for the OS and main process).
+  Code     :
+             n_workers = max(1, mp.cpu_count() - 2)
+             with mp.Pool(processes=n_workers) as pool:
+                 pool.imap_unordered(_process_one, tasks)
+  Why      : Augmenting 26,000 training images × 3 copies = 78,000 write
+             operations. Sequential processing would take too long. Parallel
+             workers saturate all CPU cores and the NVMe disk simultaneously,
+             reducing total runtime by a factor proportional to core count.
+
+Step 8 — Label Copying (unchanged)
+  What     : For each augmented image, the original .txt label file is copied
+             unchanged with the new image name.
+  Code     :
+             shutil.copy2(lbl_path, new_lbl)
+  Why      : Augmentation here is photometric only (colour and brightness
+             changes). Bounding box positions are not changed, so the original
+             label is valid for all augmented copies. Geometric augmentations
+             (flips, rotations) that would invalidate box coords are handled
+             by YOLOv8's internal augmentation pipeline during training instead.
+
+OUTPUT:  data/processed/detector_yolo_aug/images/train/  — original + 3 augmented
+         data/processed/detector_yolo_aug/labels/train/  — copied label files
+         Total: ~79,000 training images  (from ~26,000 originals)
+
+
+================================================================================
+  COMPLETE PREPROCESSING PIPELINE — SUMMARY
+================================================================================
+
+                         What it does               Input → Output
+  ─────────────────────────────────────────────────────────────────────────────
+  extract_frames.py  │ Sample + filter dashcam    │ .mp4 videos
+    _phash()         │ frames (blur + dedup)       │   → dashcam_frames/*.jpg
+    _blur_score()    │                             │
+    extract_from_    │                             │
+    video()          │                             │
+  ─────────────────────────────────────────────────────────────────────────────
+  prepare_data.py    │ Parse 3 annotation formats  │ VOC XML + CSV + YAML
+    parse_pothole_   │ → unified YOLO format        │   → detector_yolo/
+    xml()            │ merge 4 datasets             │       images/{train,val,test}
+    parse_lisa_      │ 70/20/10 train/val/test      │       labels/{train,val,test}
+    annotations()    │ split (seed=42)              │       dataset.yaml
+    parse_bosch_     │                             │
+    annotations()    │ Crop potholes + area-ratio  │   → severity_crops/
+    convert_bbox_    │ auto-label Low/Med/High      │       {train,val,test}/
+    to_yolo()        │                             │       {Low,Medium,High}/
+    severity_label() │                             │
+    crop_pothole()   │                             │
+  ─────────────────────────────────────────────────────────────────────────────
+  augment.py         │ GPU weather augmentation:   │ detector_yolo/train
+    add_rain()       │ Rain, Fog, Night, Wet road  │   → detector_yolo_aug/train
+    add_fog()        │ 3 copies per image          │
+    add_night()      │ Parallel multiprocessing    │ 26k images → 79k images
+    add_wet_road()   │ Labels copied unchanged     │
+  ─────────────────────────────────────────────────────────────────────────────
+
+
+================================================================================
+  WHY EACH STEP IS USEFUL — ONE-LINE SUMMARY
+================================================================================
+
+  Time sampling          → Reduces 100k+ video frames to ~2,400 usable candidates
+  Blur filtering         → Removes unreliable frames where pothole edges are blurred
+  Perceptual dedup       → Avoids annotation set full of redundant near-identical images
+  VOC/CSV/YAML parsing   → Brings 4 different formats into one consistent structure
+  Coordinate conversion  → YOLO requires normalised [0,1] coords, not pixel coords
+  Dataset merging        → More data variety = better generalisation
+  70/20/10 split         → Ensures test metrics are truly unseen by the model
+  Severity auto-label    → Avoids manual severity labelling of thousands of crops
+  Crop + padding         → Isolates each pothole for the severity classifier
+  Weather augmentation   → Teaches the model to detect in rain/fog/night conditions
+  3× data expansion      → Reduces overfitting, especially on smaller datasets
+  Parallel processing    → Makes augmenting 79k images practical in reasonable time
+
+
+================================================================================
+  END OF DATA PREPROCESSING DETAILS
+================================================================================

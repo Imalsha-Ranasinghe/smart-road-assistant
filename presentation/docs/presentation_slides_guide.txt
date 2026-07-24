@@ -1,0 +1,245 @@
+================================================================================
+  DATA PREPROCESSING — SLIDE GUIDE
+  Smart Road Assistant | CV Project
+================================================================================
+
+STORY IN ONE SENTENCE:
+  "Raw dashcam videos and public datasets were unusable for training directly —
+   we applied four CV/IP techniques to turn them into a clean, diverse,
+   weather-robust training dataset."
+
+STRUCTURE: 5 slides, ~5 minutes total
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SLIDE 1 — "THE PROBLEM WITH RAW DATA"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Headline:  "Our data had 3 problems before a single model could be trained."
+
+Show this as 3 problem boxes with one line each:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Problem 1: Dashcam videos had 108,000 frames per hour.      │
+  │            Most were blurry or near-identical.              │
+  ├─────────────────────────────────────────────────────────────┤
+  │ Problem 2: 4 public datasets, 4 different label formats.    │
+  │            VOC XML, CSV, YAML — none ready for YOLO.        │
+  ├─────────────────────────────────────────────────────────────┤
+  │ Problem 3: Every dataset was clear-weather only.            │
+  │            Model would fail in rain, fog, and night.        │
+  └─────────────────────────────────────────────────────────────┘
+
+Then show the solution arrow:
+  3 Problems  →  3 preprocessing stages  →  Training-ready dataset
+
+Say: "Each problem was solved with a specific image processing technique."
+
+  TIME: 30 seconds. NO CODE. NO MATH. Just the problem statement.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SLIDE 2 — "CLEANING DASHCAM FRAMES"
+Two CV/IP techniques on one slide
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Headline:  "We used the Laplacian operator and perceptual hashing to keep
+            only the frames worth annotating."
+
+LEFT HALF — BLUR DETECTION
+  Technique:  Laplacian Operator (2nd-order derivative)
+  Concept:    Sharp edges → high Laplacian response.
+              Blurry edges → near-zero Laplacian response.
+  Visual:     Show 2 rows side by side —
+              Row 1: Sharp frame | Laplacian heatmap (bright, busy)  → KEPT
+              Row 2: Blurry frame | Laplacian heatmap (dark, flat)   → REJECTED
+  One number: Var > 60 = kept.  Var < 60 = rejected.
+
+RIGHT HALF — DUPLICATE REMOVAL
+  Technique:  Perceptual Hashing (DCT — same transform as JPEG)
+  Concept:    Each frame is compressed to a 64-bit fingerprint.
+              Two frames with ≤ 6 differing bits are considered identical.
+  Visual:     Show 3 frames from the same stretch of road (nearly identical)
+              → Only 1 kept, 2 rejected.
+              Below each: show the tiny 8×8 DCT hash grid (black/white squares)
+
+RESULT BAR at the bottom of the slide:
+  108,000 raw frames  →  2,400 diverse, sharp frames
+
+HOW TO GET THE FIGURE:
+  Run the blur_detection code block (see appendix at end of this file).
+  Screenshot 3 similar dashcam frames from data/raw/dashcam_frames/.
+  The 8×8 hash grid: draw it manually in PowerPoint as a black/white 8×8 grid.
+
+  TIME: 1 minute.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SLIDE 3 — "FROM 4 FORMATS TO 1 + AUTOMATIC SEVERITY LABELS"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Headline:  "We unified 4 annotation formats and automatically generated
+            severity labels using spatial analysis — no manual work."
+
+TOP HALF — FORMAT UNIFICATION
+  Show a simple conversion diagram:
+
+  VOC XML  ──┐
+  LISA CSV  ─┼──  coordinate normalisation  ──►  YOLO .txt
+  Bosch YAML─┘         formula:                  class  xc  yc  w  h
+  Our own   ─┘     xc = (xmin+xmax) / (2×W)     (all values 0–1)
+                   w  = (xmax−xmin) / W
+
+  One line to say: "YOLO needs normalised [0,1] coordinates.
+                    All four formats used absolute pixel coordinates.
+                    We converted every single annotation."
+
+BOTTOM HALF — SEVERITY AUTO-LABELLING (the clever part)
+  The insight: a larger bounding box = closer/bigger pothole = more dangerous.
+  So we measure: box area ÷ image area
+
+  Show 3 example images with bounding boxes of different sizes:
+
+  [Small box]   ratio = 1.8%  →  LOW    (distant, small pothole)
+  [Medium box]  ratio = 7%    →  MEDIUM (moderate)
+  [Large box]   ratio = 15%   →  HIGH   (close, large pothole — HIGH DANGER)
+
+  Then show the crop being extracted (ROI extraction: box + 10px padding → 128×128)
+
+  One number:  "Zero manual severity annotations. All labels generated
+                from geometry."
+
+HOW TO GET THE FIGURES:
+  Run notebook 07-validation.ipynb → Section 1 → screenshot the crop samples cell.
+  For the format diagram: draw in PowerPoint using the formula shown above.
+
+  TIME: 1 minute.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SLIDE 4 — "MAKING THE MODEL WEATHER-PROOF"  ← THE SHOWSTOPPER SLIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Headline:  "Four image processing techniques turned every clear-day image
+            into 4 training samples — one for each weather condition."
+
+THE MAIN FIGURE — 5 rows × 5 columns (generate with code below):
+
+               Image 1    Image 2    Image 3    Image 4    Image 5
+  Original       [ ]        [ ]        [ ]        [ ]        [ ]
+  Rain           [ ]        [ ]        [ ]        [ ]        [ ]
+  Fog            [ ]        [ ]        [ ]        [ ]        [ ]
+  Night          [ ]        [ ]        [ ]        [ ]        [ ]
+  Wet Road       [ ]        [ ]        [ ]        [ ]        [ ]
+
+On the right side of the slide, a mini table:
+
+  ┌────────────┬──────────────────────────────┐
+  │ Rain       │ 1D Convolution kernel        │
+  │            │ (vertical motion blur)       │
+  ├────────────┼──────────────────────────────┤
+  │ Fog        │ Alpha Blending               │
+  │            │ image×(1−α) + white×α        │
+  ├────────────┼──────────────────────────────┤
+  │ Night      │ Gamma Point Operation        │
+  │            │ pixels × 0.18–0.30           │
+  ├────────────┼──────────────────────────────┤
+  │ Wet Road   │ HSV Saturation Boost         │
+  │            │ S channel × 1.2–1.5          │
+  └────────────┴──────────────────────────────┘
+
+RESULT BAR at the bottom:
+  26,000 training images  →  79,000 training images   (3× expansion)
+  All labels preserved — augmentation is photometric only.
+
+HOW TO GENERATE THE 5×5 GRID (run in a notebook cell):
+
+  import sys; sys.path.insert(0, '../src')
+  import cv2, matplotlib.pyplot as plt
+  from pathlib import Path
+  from augment import add_rain, add_fog, add_night, add_wet_road
+  from augment import img_to_tensor, tensor_to_img
+
+  imgs    = sorted((Path('..').resolve() /
+                    'data/processed/detector_yolo/images/val').glob('*.jpg'))[:5]
+  effects = [('Original', lambda t: t), ('Rain',     add_rain),
+             ('Fog',      add_fog),     ('Night',    add_night),
+             ('Wet Road', add_wet_road)]
+
+  fig, axes = plt.subplots(5, 5, figsize=(16, 14))
+  for col, p in enumerate(imgs):
+      t = img_to_tensor(cv2.imread(str(p)))
+      for row, (label, fn) in enumerate(effects):
+          out = tensor_to_img(fn(t.clone()))
+          axes[row][col].imshow(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+          axes[row][col].axis('off')
+          if col == 0:
+              axes[row][col].set_ylabel(label, fontsize=12,
+                  fontweight='bold', rotation=0, labelpad=55, va='center')
+  plt.suptitle('Weather Augmentation — Data Preprocessing',
+               fontsize=14, fontweight='bold')
+  plt.tight_layout()
+  plt.savefig('augmentation_grid.png', dpi=150, bbox_inches='tight')
+  plt.show()
+
+  TIME: 1.5 minutes. Let the grid speak — it is the most visual slide.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SLIDE 5 — "WHAT WE PRODUCED"  (proof slide)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Headline:  "The preprocessing pipeline produced 3 ready-to-train datasets."
+
+Show a clean 3-row table:
+
+  ┌──────────────────────────┬──────────┬──────────┬──────────┬────────────────────┐
+  │ Dataset                  │  Train   │   Val    │   Test   │ Used for           │
+  ├──────────────────────────┼──────────┼──────────┼──────────┼────────────────────┤
+  │ Detector (original)      │ ~18,000  │ ~5,200   │ ~2,600   │ Stage 1 training   │
+  │ Detector (augmented)     │ ~79,000  │ same     │ same     │ Stage 1 full run   │
+  │ Severity crops           │ split    │ split    │ split    │ Stage 2 classifier │
+  │ (Low / Medium / High)    │  70%     │  20%     │  10%     │                    │
+  └──────────────────────────┴──────────┴──────────┴──────────┴────────────────────┘
+
+Below the table, 3 screenshot proof items (take these before the presentation):
+  Screenshot 1: Windows Explorer showing data/processed/detector_yolo_aug/images/train/
+                with the file count visible (bottom status bar)
+  Screenshot 2: Notebook 07-validation.ipynb Section 1 bar charts
+                (class distribution + train/val/test split)
+  Screenshot 3: severity_crops/ folder tree showing Low/ Medium/ High/ subfolders
+
+  TIME: 45 seconds.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINAL CHECKLIST — WHAT TO PREPARE BEFORE PRESENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [ ] Run blur_detection code → save blur_detection.png
+  [ ] Run augmentation_grid code → save augmentation_grid.png
+  [ ] Run notebook 07-validation.ipynb Section 1 → screenshot the charts
+  [ ] Open Windows Explorer → data/processed/detector_yolo_aug/images/train/
+      → screenshot with file count visible in status bar
+  [ ] Open severity_crops/ folder → screenshot the Low/ Medium/ High/ tree
+  [ ] Pick 3 near-identical dashcam frames from data/raw/dashcam_frames/
+      → screenshot for the pHash dedup example
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3 LINES TO SAY IF THE AUDIENCE ASKS "WHY DID YOU DO THIS?"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  On blur filtering:
+  "A blurry frame has no detectable edge. Training on it teaches the model
+   to draw boxes around nothing."
+
+  On augmentation:
+  "Road hazards don't disappear when it rains. Our model shouldn't either."
+
+  On severity auto-labelling:
+  "A pothole that fills 15% of your windscreen is more urgent than one
+   that covers 2%. Geometry does the labelling for us."
+
+================================================================================
+  END
+================================================================================
